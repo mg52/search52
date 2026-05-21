@@ -207,7 +207,7 @@ func newTestEngineForE2E() *SearchEngine {
 	return NewSearchEngine(
 		[]string{"title"},
 		map[string]bool{"genre": true},
-		10, // page size
+		10, // return size
 	)
 }
 
@@ -412,7 +412,7 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 
 	// Metadata restored
 	if loaded.ResultSize != 10 {
-		t.Fatalf("PageSize mismatch: got=%d exp=%d", loaded.ResultSize, 10)
+		t.Fatalf("ResultSize mismatch: got=%d exp=%d", loaded.ResultSize, 10)
 	}
 	if len(loaded.IndexFields) != 1 || loaded.IndexFields[0] != "name" {
 		t.Fatalf("IndexFields mismatch: got=%v", loaded.IndexFields)
@@ -645,6 +645,226 @@ func TestMultiTermSearch_E2E_WithScoringOrder(t *testing.T) {
 	if !(res.Docs[0].Score >= res.Docs[1].Score &&
 		res.Docs[1].Score >= res.Docs[2].Score) {
 		t.Fatalf("scores not sorted descending: %+v", res.Docs)
+	}
+}
+
+func TestSingleTermSearch_E2E_WithScoringOrder(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"title", "description"},
+		map[string]bool{"category": true},
+		10,
+	)
+
+	docs := []map[string]interface{}{
+		{
+			"id":          "1",
+			"title":       "another brilliant dark coffee",
+			"description": "New coffee beans from around the world",
+			"category":    "drink",
+		},
+		{
+			"id":          "2",
+			"title":       "a good mild coffee",
+			"description": "Good coffee beans from America",
+			"category":    "drink",
+		},
+		{
+			"id":          "3",
+			"title":       "decaffeinated coffee",
+			"description": "small drink for you",
+			"category":    "drink",
+		},
+	}
+
+	for _, d := range docs {
+		if err := se.AddOrUpdateDocument(d); err != nil {
+			t.Fatalf("AddOrUpdateDocument failed: %v", err)
+		}
+	}
+
+	res := se.Search("caffee", nil)
+	if res == nil {
+		t.Fatalf("Search returned nil")
+	}
+
+	if len(res.Docs) != 3 {
+		t.Fatalf("expected 3 results, got %d: %+v", len(res.Docs), res.Docs)
+	}
+
+	gotOrder := []string{
+		res.Docs[0].ID,
+		res.Docs[1].ID,
+		res.Docs[2].ID,
+	}
+
+	expectedOrder := []string{"2", "1", "3"}
+
+	for i := range expectedOrder {
+		if gotOrder[i] != expectedOrder[i] {
+			t.Fatalf("unexpected ranking order: got=%v expected=%v", gotOrder, expectedOrder)
+		}
+	}
+
+	// 3) Extra: assert strictly descending scores (stronger check)
+	if !(res.Docs[0].Score >= res.Docs[1].Score &&
+		res.Docs[1].Score >= res.Docs[2].Score) {
+		t.Fatalf("scores not sorted descending: %+v", res.Docs)
+	}
+}
+
+func Test_E2E(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"title", "description"},
+		map[string]bool{"category": true},
+		5,
+	)
+
+	docs := []map[string]interface{}{
+		{
+			"id":          "1",
+			"title":       "another brilliant dark coffee",
+			"description": "New coffee beans from around the world",
+			"category":    "drink",
+		},
+		{
+			"id":          "2",
+			"title":       "a good mild coffee",
+			"description": "Good coffee beans from America",
+			"category":    "drink",
+		},
+		{
+			"id":          "3",
+			"title":       "decaffeinated coffee",
+			"description": "small drink for you",
+			"category":    "drink",
+		},
+		{
+			"id":          "4",
+			"title":       "strong espresso roast",
+			"description": "Italian style espresso beans",
+			"category":    "drink",
+		},
+		{
+			"id":          "5",
+			"title":       "cold brew coffee bottle",
+			"description": "Refreshing chilled coffee beverage",
+			"category":    "drink",
+		},
+		{
+			"id":          "6",
+			"title":       "vanilla flavored latte",
+			"description": "Sweet creamy milk coffee",
+			"category":    "drink",
+		},
+		{
+			"id":          "7",
+			"title":       "premium arabica beans",
+			"description": "High quality beans from Colombia",
+			"category":    "ingredient",
+		},
+		{
+			"id":          "8",
+			"title":       "caramel cappuccino mix",
+			"description": "Instant creamy cappuccino drink",
+			"category":    "drink",
+		},
+		{
+			"id":          "9",
+			"title":       "breakfast black tea",
+			"description": "Strong tea leaves for mornings",
+			"category":    "drink",
+		},
+		{
+			"id":          "10",
+			"title":       "organic green tea",
+			"description": "Fresh antioxidant rich tea",
+			"category":    "drink",
+		},
+		{
+			"id":          "11",
+			"title":       "hazelnut coffee creamer",
+			"description": "Smooth nutty flavor for coffee",
+			"category":    "ingredient",
+		},
+		{
+			"id":          "12",
+			"title":       "dark chocolate mocha",
+			"description": "Chocolate flavored espresso drink",
+			"category":    "drink",
+		},
+		{
+			"id":          "13",
+			"title":       "iced caramel macchiato",
+			"description": "Cold espresso with caramel milk",
+			"category":    "drink",
+		},
+		{
+			"id":          "14",
+			"title":       "fresh roasted decaf beans",
+			"description": "Decaffeinated beans with smooth taste",
+			"category":    "ingredient",
+		},
+		{
+			"id":          "15",
+			"title":       "coffee grinder machine",
+			"description": "Electric grinder for coffee beans",
+			"category":    "equipment",
+		},
+		{
+			"id":          "16",
+			"title":       "espresso brewing guide",
+			"description": "Learn to brew rich espresso shots",
+			"category":    "book",
+		},
+		{
+			"id":          "17",
+			"title":       "caffeine free herbal tea",
+			"description": "Relaxing herbal evening drink",
+			"category":    "drink",
+		},
+		{
+			"id":          "18",
+			"title":       "double shot americano",
+			"description": "Bold espresso diluted with water",
+			"category":    "drink",
+		},
+		{
+			"id":          "19",
+			"title":       "french press coffee maker",
+			"description": "Classic manual brewing equipment",
+			"category":    "equipment",
+		},
+		{
+			"id":          "20",
+			"title":       "toasted coconut latte",
+			"description": "Tropical flavored milk coffee",
+			"category":    "drink",
+		},
+		{
+			"id":          "21",
+			"title":       "Big coffee",
+			"description": "Coffee, coffee and more coffee",
+			"category":    "drink",
+		},
+	}
+
+	for _, d := range docs {
+		if err := se.AddOrUpdateDocument(d); err != nil {
+			t.Fatalf("AddOrUpdateDocument failed: %v", err)
+		}
+	}
+
+	res := se.Search("caffee", nil)
+	if res == nil {
+		t.Fatalf("Search returned nil")
+	}
+
+	if len(res.Docs) != 5 {
+		t.Fatalf("expected 3 results, got %d: %+v", len(res.Docs), res.Docs)
+	}
+
+	if res.Docs[0].ID != "21" && res.Docs[0].Score != 66664 {
+		t.Fatalf("expected first results is different, got ID: %s: %d", res.Docs[0].ID, res.Docs[0].Score)
 	}
 }
 

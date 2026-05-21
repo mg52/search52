@@ -17,6 +17,7 @@ import (
 	"github.com/mg52/search/internal/symspell"
 )
 
+// TODO: make it var in the engine definition
 const MaxPrefixTerms = 400
 
 type internalHit struct {
@@ -163,10 +164,10 @@ type SearchEngine struct {
 	nextInternalID     uint32
 
 	// Docs + filters
-	Documents  map[uint32]map[string]interface{} // internalDocID -> doc fields
-	FilterBits map[string][]uint64               // "field:value" -> bitset of internalDocIDs
-	Prefix     map[string][]string               // prefix -> matching terms (capped at MaxPrefixTerms)
-	Symspell   *symspell.SymSpell
+	Documents   map[uint32]map[string]interface{} // internalDocID -> doc fields
+	FilterBits  map[string][]uint64               // "field:value" -> bitset of internalDocIDs
+	Prefix      map[string][]string               // prefix -> matching terms (capped at MaxPrefixTerms)
+	Symspell    *symspell.SymSpell
 	IndexFields []string
 	Filters     map[string]bool
 	ResultSize  int
@@ -445,6 +446,7 @@ func (se *SearchEngine) indexTokenLocked(term string, id uint32, score int) {
 	docMap, termExists := se.DataMap[term]
 	if !termExists {
 		se.termSet.Store(term, struct{}{})
+		// TODO: make it var in the engine definition
 		if len(term) >= 4 {
 			se.Symspell.AddWord(term)
 		}
@@ -893,6 +895,7 @@ func (se *SearchEngine) Search(query string, filters map[string][]interface{}) *
 // SingleTermSearch resolves a single-token query via prefix (preferred) or fuzzy expansions.
 func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[string][]interface{}) *SearchResult {
 	parsedQuery := make(map[string][]string)
+	// TODO: make it var in the engine definition
 	maxPrefixTokens := 3
 	maxFuzzyTokens := 3
 
@@ -959,6 +962,7 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string
 
 	_, lastExists := se.termSet.Load(rawLastTerm)
 	se.mu.RLock()
+	// TODO: make it var in the engine definition
 	maxPrefix := 40
 	if len(se.Prefix[rawLastTerm]) < maxPrefix {
 		maxPrefix = len(se.Prefix[rawLastTerm])
@@ -968,6 +972,7 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string
 		if _, ok := se.termSet.Load(firstTerm); ok {
 			termArrList[k] = []string{firstTerm}
 		}
+		// TODO: make it var in the engine definition
 		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, 10)...)
 	}
 	se.mu.RUnlock()
