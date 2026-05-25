@@ -2,26 +2,122 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
 	"strings"
+
+	"github.com/mg52/search/internal/engine"
 )
 
 func runVocab(args []string) {
 	fs := flag.NewFlagSet("vocab", flag.ExitOnError)
 	size := fs.Int("size", 100_000, "Number of unique words to generate")
-	out  := fs.String("out", "vocab.txt", "Output file path")
+	out := fs.String("out", "vocab.txt", "Output file path")
 	seed := fs.Int64("seed", 42, "Random seed")
+	data := fs.String("data", "", "Optional JSON document file to extract vocabulary from")
+	fields := fs.String("fields", "title,tags", "Comma-separated fields to extract when -data is set")
 	_ = fs.Parse(args)
 
-	words := generateVocab(*size, *seed)
+	var (
+		words []string
+		err   error
+	)
+	if *data != "" {
+		words, err = extractVocabFromJSON(*data, splitCSV(*fields), *size)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "extract vocab: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		words = generateVocab(*size, *seed)
+	}
 	if err := writeVocab(*out, words); err != nil {
 		fmt.Fprintf(os.Stderr, "write vocab: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Vocabulary: %d words → %s\n", len(words), *out)
+}
+
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func extractVocabFromJSON(path string, fields []string, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("size must be positive")
+	}
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("at least one field is required")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(bufio.NewReaderSize(f, 16*1024*1024))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("read opening token: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '[' {
+		return nil, fmt.Errorf("%s must be a JSON array", path)
+	}
+
+	seen := make(map[string]struct{}, limit)
+	words := make([]string, 0, limit)
+	for dec.More() && len(words) < limit {
+		var doc map[string]interface{}
+		if err := dec.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("decode document: %w", err)
+		}
+		for _, field := range fields {
+			value, ok := doc[field]
+			if !ok {
+				continue
+			}
+			var tokens []string
+			switch v := value.(type) {
+			case string:
+				tokens = engine.Tokenize(v)
+			case []interface{}:
+				for _, item := range v {
+					if s, ok := item.(string); ok {
+						tokens = append(tokens, engine.Tokenize(s)...)
+					}
+				}
+			}
+			for _, token := range tokens {
+				if _, ok := seen[token]; ok {
+					continue
+				}
+				seen[token] = struct{}{}
+				words = append(words, token)
+				if len(words) >= limit {
+					break
+				}
+			}
+			if len(words) >= limit {
+				break
+			}
+		}
+	}
+	if len(words) == 0 {
+		return nil, fmt.Errorf("no tokens extracted from %s", path)
+	}
+	return words, nil
 }
 
 func generateVocab(n int, seed int64) []string {

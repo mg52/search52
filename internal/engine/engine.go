@@ -17,8 +17,7 @@ import (
 	"github.com/mg52/search/internal/symspell"
 )
 
-// TODO: make it var in the engine definition
-const MaxPrefixTerms = 400
+const MaxPrefixTerms = 5_000
 
 type internalHit struct {
 	id    uint32

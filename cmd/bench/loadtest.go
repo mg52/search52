@@ -4,12 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,16 +19,17 @@ import (
 
 func runLoadtest(args []string) {
 	fs := flag.NewFlagSet("loadtest", flag.ExitOnError)
-	baseURL   := fs.String("url", "http://localhost:8080/search", "Search endpoint URL")
+	baseURL := fs.String("url", "http://localhost:8080/search", "Search endpoint URL")
 	indexName := fs.String("index", "bench", "Index name (?index=)")
 	vocabFile := fs.String("vocab", "vocab.txt", "Vocabulary file (produced by vocab command)")
-	workers   := fs.Int("workers", 8, "Number of parallel workers")
-	requests  := fs.Int("requests", 10_000, "Total requests to send")
-	timeout   := fs.Duration("timeout", 10*time.Second, "Per-request HTTP timeout")
-	seed      := fs.Int64("seed", time.Now().UnixNano(), "Random seed")
+	workers := fs.Int("workers", 8, "Number of parallel workers")
+	requests := fs.Int("requests", 10_000, "Total requests to send")
+	timeout := fs.Duration("timeout", 10*time.Second, "Per-request HTTP timeout")
+	seed := fs.Int64("seed", time.Now().UnixNano(), "Random seed")
 	keepAlive := fs.Bool("keepalive", true, "Use HTTP keep-alive")
 	filterPct := fs.Int("filter-pct", 50, "Percentage of requests with a year filter (0-100)")
-	multiPct  := fs.Int("multi-pct", 50, "Percentage of multi-term queries (0-100)")
+	multiPct := fs.Int("multi-pct", 50, "Percentage of multi-term queries (0-100)")
+	modeMix := fs.String("mode-mix", "random", "Mode mix: random or balanced. Balanced matches benchmark.go's four modes evenly.")
 	_ = fs.Parse(args)
 
 	vocab, err := loadVocabFile(*vocabFile)
@@ -55,14 +58,33 @@ func runLoadtest(args []string) {
 	var (
 		sent      int64
 		errCount  int64
+		reqErrors int64
 		resultsMu sync.Mutex
 		results   = make([]ltResult, 0, *requests)
+		statusMu  sync.Mutex
+		statuses  = make(map[int]int)
 	)
 
 	fmt.Printf("Target:  %s  index=%s\n", *baseURL, *indexName)
-	fmt.Printf("Workers: %d  |  Requests: %d  |  filter-pct: %d%%  |  multi-pct: %d%%\n",
-		*workers, *requests, *filterPct, *multiPct)
+	fmt.Printf("Workers: %d  |  Requests: %d  |  mode-mix: %s  |  filter-pct: %d%%  |  multi-pct: %d%%\n",
+		*workers, *requests, *modeMix, *filterPct, *multiPct)
 	fmt.Println("Starting...")
+
+	querySeed := rand.New(rand.NewSource(*seed))
+	singleQs := buildSingleQueries(querySeed, vocab, queryPoolSize)
+	multiQs := buildMultiQueries(querySeed, vocab, queryPoolSize)
+	yearFs := buildYearFilters(querySeed, queryPoolSize)
+	yearFilterValue := func(i int) int {
+		values := yearFs[i%queryPoolSize]["year"]
+		if len(values) == 0 {
+			return 2000
+		}
+		year, ok := values[0].(int)
+		if !ok {
+			return 2000
+		}
+		return year
+	}
 
 	startAll := time.Now()
 	var wg sync.WaitGroup
@@ -74,34 +96,59 @@ func runLoadtest(args []string) {
 			r := rand.New(rand.NewSource(*seed + int64(workerID)*1_000_003))
 
 			for {
-				if atomic.AddInt64(&sent, 1) > int64(*requests) {
+				reqNo := atomic.AddInt64(&sent, 1)
+				if reqNo > int64(*requests) {
 					return
 				}
-				isMulti  := r.Intn(100) < *multiPct
-				isFilter := r.Intn(100) < *filterPct
-
+				idx := int(reqNo - 1)
+				var isMulti, isFilter bool
 				var q string
-				if isMulti {
-					q = ltMultiQuery(r, vocab)
+
+				if *modeMix == "balanced" {
+					switch idx % 4 {
+					case 0:
+						isMulti, isFilter = false, false
+					case 1:
+						isMulti, isFilter = false, true
+					case 2:
+						isMulti, isFilter = true, false
+					default:
+						isMulti, isFilter = true, true
+					}
 				} else {
-					q = ltSingleQuery(r, vocab)
+					isMulti = r.Intn(100) < *multiPct
+					isFilter = r.Intn(100) < *filterPct
 				}
-				reqURL := buildSearchURL(*baseURL, *indexName, q, isFilter, r)
+
+				if isMulti {
+					q = multiQs[idx%queryPoolSize]
+				} else {
+					q = singleQs[idx%queryPoolSize]
+				}
+				reqURL := buildSearchURL(*baseURL, *indexName, q, isFilter, yearFilterValue(idx))
 
 				t0 := time.Now()
 				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, reqURL, nil)
 				resp, reqErr := client.Do(req)
-				lat := time.Since(t0)
 
-				res := ltResult{lat: lat, mode: ltMode{isMulti, isFilter}, err: reqErr != nil}
+				res := ltResult{mode: ltMode{isMulti, isFilter}, err: reqErr != nil}
 				if reqErr != nil {
+					atomic.AddInt64(&reqErrors, 1)
 					atomic.AddInt64(&errCount, 1)
 				} else {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+					res.lat = time.Since(t0)
+					statusMu.Lock()
+					statuses[resp.StatusCode]++
+					statusMu.Unlock()
 					if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 						atomic.AddInt64(&errCount, 1)
 						res.err = true
 					}
-					_ = resp.Body.Close()
+				}
+				if reqErr != nil {
+					res.lat = time.Since(t0)
 				}
 				resultsMu.Lock()
 				results = append(results, res)
@@ -128,6 +175,7 @@ func runLoadtest(args []string) {
 	fmt.Printf("\n──────────────────────────────────────────────────────\n")
 	fmt.Printf("Requests: %-6d  Workers: %-3d  Errors: %-4d  GOMAXPROCS: %d\n",
 		len(results), *workers, atomic.LoadInt64(&errCount), runtime.GOMAXPROCS(0))
+	fmt.Printf("Client errors: %-4d  HTTP statuses: %s\n", atomic.LoadInt64(&reqErrors), formatStatusCounts(statuses))
 	fmt.Printf("Wall time: %-12s  RPS: %.1f\n", elapsed.Round(time.Millisecond), rps)
 	fmt.Printf("──────────────────────────────────────────────────────\n")
 	fmt.Println("Overall latency:")
@@ -165,6 +213,22 @@ func runLoadtest(args []string) {
 		)
 	}
 	fmt.Printf("──────────────────────────────────────────────────────\n")
+}
+
+func formatStatusCounts(statuses map[int]int) string {
+	if len(statuses) == 0 {
+		return "{}"
+	}
+	codes := make([]int, 0, len(statuses))
+	for code := range statuses {
+		codes = append(codes, code)
+	}
+	sort.Ints(codes)
+	parts := make([]string, 0, len(codes))
+	for _, code := range codes {
+		parts = append(parts, fmt.Sprintf("%d:%d", code, statuses[code]))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
 }
 
 // ---- query helpers ----
@@ -220,7 +284,7 @@ func joinTerms(terms []string) string {
 	return string(b)
 }
 
-func buildSearchURL(base, index, q string, addFilter bool, r *rand.Rand) string {
+func buildSearchURL(base, index, q string, addFilter bool, year int) string {
 	u, err := url.Parse(base)
 	if err != nil {
 		return base
@@ -229,7 +293,7 @@ func buildSearchURL(base, index, q string, addFilter bool, r *rand.Rand) string 
 	params.Set("index", index)
 	params.Set("q", q)
 	if addFilter {
-		params.Set("filter", fmt.Sprintf("year:%d", 2000+r.Intn(25)))
+		params.Set("filter", fmt.Sprintf("year:%d", year))
 	}
 	u.RawQuery = params.Encode()
 	return u.String()
