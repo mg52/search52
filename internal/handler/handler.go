@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mg52/search/internal/engine"
+	"github.com/mg52/search52/internal/engine"
 )
 
 // AddToIndexRequest is the payload for adding documents to an existing index.

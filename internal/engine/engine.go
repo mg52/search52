@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mg52/search/internal/symspell"
+	"github.com/mg52/search52/internal/symspell"
 )
 
 type Document struct {

@@ -12,19 +12,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mg52/search/internal/engine"
+	"github.com/mg52/search52/internal/engine"
 )
 
 const queryPoolSize = 1000
 
 func runBenchmark(args []string) {
 	fs := flag.NewFlagSet("benchmark", flag.ExitOnError)
-	dataFile   := fs.String("data", "data.json", "JSON data file (output of datagen)")
-	vocabFile  := fs.String("vocab", "vocab.txt", "Vocabulary file (output of vocab)")
-	queries    := fs.Int("queries", 5_000, "Number of queries to measure per mode")
+	dataFile := fs.String("data", "data.json", "JSON data file (output of datagen)")
+	vocabFile := fs.String("vocab", "vocab.txt", "Vocabulary file (output of vocab)")
+	queries := fs.Int("queries", 5_000, "Number of queries to measure per mode")
 	resultSize := fs.Int("result-size", 100, "Engine result size (top-k)")
-	warmup     := fs.Int("warmup", 500, "Warmup iterations before measuring")
-	seed       := fs.Int64("seed", 99, "Random seed for query generation")
+	warmup := fs.Int("warmup", 500, "Warmup iterations before measuring")
+	seed := fs.Int64("seed", 99, "Random seed for query generation")
 	_ = fs.Parse(args)
 
 	vocab, err := loadVocabFile(*vocabFile)
@@ -63,8 +63,8 @@ func runBenchmark(args []string) {
 
 	r := rand.New(rand.NewSource(*seed))
 	singleQs := buildSingleQueries(r, vocab, queryPoolSize)
-	multiQs  := buildMultiQueries(r, vocab, queryPoolSize)
-	yearFs   := buildYearFilters(r, queryPoolSize)
+	multiQs := buildMultiQueries(r, vocab, queryPoolSize)
+	yearFs := buildYearFilters(r, queryPoolSize)
 
 	type modeSpec struct {
 		label  string
@@ -79,9 +79,9 @@ func runBenchmark(args []string) {
 	}
 
 	type modeStats struct {
-		label      string
-		lats       []int64
-		bytesPerOp uint64
+		label       string
+		lats        []int64
+		bytesPerOp  uint64
 		allocsPerOp uint64
 	}
 	results := make([]modeStats, len(modes))

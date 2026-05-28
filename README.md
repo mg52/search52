@@ -1,5 +1,5 @@
-![build](https://github.com/mg52/search/actions/workflows/go.yml/badge.svg)
-[![codecov](https://codecov.io/gh/mg52/search/branch/main/graph/badge.svg)](https://codecov.io/gh/mg52/search)
+![build](https://github.com/mg52/search52/actions/workflows/go.yml/badge.svg)
+[![codecov](https://codecov.io/gh/mg52/search52/branch/main/graph/badge.svg)](https://codecov.io/gh/mg52/search52)
 
 # In-Memory Search Engine
 

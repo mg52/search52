@@ -4,7 +4,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/mg52/search/internal/handler"
+	"github.com/mg52/search52/internal/handler"
 )
 
 func main() {

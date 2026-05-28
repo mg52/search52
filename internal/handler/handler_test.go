@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mg52/search/internal/engine"
+	"github.com/mg52/search52/internal/engine"
 )
 
 func assertEngineSearchIDs(t *testing.T, docs []engine.ReturnedDocument, exp ...string) {

@@ -10,7 +10,7 @@ packages="$(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end
 go test -covermode=atomic -coverprofile="$tmp_profile" $packages
 
 awk '
-	NR == 1 || $1 !~ /^github\.com\/mg52\/search\/cmd\/bench\// {
+	NR == 1 || $1 !~ /^github\.com\/mg52\/search52\/cmd\/bench\// {
 		print
 	}
 ' "$tmp_profile" > "$profile"

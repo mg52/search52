@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mg52/search/internal/engine"
+	"github.com/mg52/search52/internal/engine"
 )
 
 func runVocab(args []string) {
