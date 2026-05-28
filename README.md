@@ -113,19 +113,6 @@ Filter queries are faster than no-filter equivalents because the bitset pre-prun
 
 ---
 
-## Test Coverage
-
-Coverage is generated with `scripts/coverage.sh`. The script includes packages that have tests and excludes the benchmark/load-test CLI package (`cmd/bench`), including vocabulary generation and dataset benchmark helpers. Those files are operational tooling rather than library/runtime behavior, and otherwise show up as 0% in the total coverage report.
-
-```bash
-./scripts/coverage.sh coverage.out
-go tool cover -func=coverage.out
-```
-
-The GitHub Actions workflow uploads this filtered `coverage.out` to Codecov. To make the README badge work on GitHub, enable the repository in Codecov and add `CODECOV_TOKEN` as a GitHub Actions secret if Codecov requires it for the repo.
-
----
-
 ## Quickstart
 
 ### Build & Run
