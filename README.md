@@ -419,6 +419,7 @@ go run ./cmd/bench vocab \
 # 1 million documents
 go run ./cmd/bench datagen -count 1000000 -vocab vocab.txt -out data.json
 
+
 # 5 million documents
 go run ./cmd/bench datagen -count 5000000 -vocab vocab.txt -out data5m.json
 ```
