@@ -1,4 +1,5 @@
 ![build](https://github.com/mg52/search/actions/workflows/go.yml/badge.svg)
+[![codecov](https://codecov.io/gh/mg52/search/branch/main/graph/badge.svg)](https://codecov.io/gh/mg52/search)
 
 # In-Memory Search Engine
 
@@ -17,7 +18,71 @@ A lightweight, fast, in-memory inverted-index search engine with HTTP handlers a
 
 ## Benchmark
 
-All numbers are from an Apple M1 Pro. Dataset: 1 000 000 and 5 000 000 documents, **100 000 unique vocabulary words**, `title` (3–20 words) and `tags` (1–10 words) index fields, `year` (2000–2024) filter field. Query mix: 65 % exact, 25 % prefix, 10 % misspelled; multi-term queries use 2–4 tokens, 10 000 measurements per mode after 1 000 warmup iterations.
+All numbers are from an Apple M1 Pro. The MusicBrainz load test uses the real `mb_5m.json` dataset. The in-process benchmark below uses generated 1 000 000 and 5 000 000 document datasets with **100 000 unique vocabulary words**, `title` (3-20 words) and `tags` (1-10 words) index fields, and `year` (2000-2024) as the filter field.
+
+### MusicBrainz 5 M HTTP load test
+
+Environment: Apple M1 Pro, darwin/arm64, Go 1.25.4, `GOMAXPROCS=10`.
+
+Dataset: `mb_5m.json`, 5 000 000 MusicBrainz documents, 585 MB JSON. Index fields: `title`, `artist`, `album`. Filter field: `year`. Result size: 100. Hard-coded prefix map cap: 5 000. Multi-term last-token prefix expansion is adaptive: 100 completions for 1-2 chars, 60 for 3-5 chars, and 50 after that. Query vocabulary: 100 000 tokens extracted from the same indexed text fields. Query generation used the same rules as `benchmark.go`: single-term queries are 65% exact, 25% prefix, 10% misspelled; multi-term queries use 2-4 tokens, 10% have one misspelled token, and the last token is prefix-truncated 25% of the time. `-mode-mix balanced` sends equal traffic to Single/NoFilter, Single/Filter, Multi/NoFilter, and Multi/Filter.
+
+Setup:
+
+```bash
+go run ./cmd/bench vocab \
+  -data mb_5m.json \
+  -fields title,artist,album \
+  -size 100000 \
+  -out mb_vocab.txt
+
+go run ./cmd/service
+
+curl -X POST http://127.0.0.1:8080/create-index \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "indexName":"mb5m",
+    "indexFields":["title","artist","album"],
+    "filters":["year"],
+    "resultCount":100
+  }'
+
+curl -X POST 'http://127.0.0.1:8080/add-to-index?indexName=mb5m' \
+  -F 'file=@mb_5m.json'
+
+go run ./cmd/bench loadtest \
+  -url http://127.0.0.1:8080/search \
+  -vocab mb_vocab.txt \
+  -index mb5m \
+  -requests 100000 \
+  -workers 16 \
+  -seed 99 \
+  -mode-mix balanced
+```
+
+Index/load summary:
+
+| Metric | Value |
+|---|---:|
+| Documents indexed | 5 000 000 |
+| JSON file size | 585 MB |
+| Vocabulary size | 100 000 |
+| InsertDocs time | 5.73 s |
+| BuildDocumentIndex time | 87.89 s |
+| Engine-reported total index time | 93.63 s |
+| HTTP upload wall time | 102.81 s |
+| Service RSS after load test | ~3.85 GiB |
+
+HTTP load-test results:
+
+The load-test client drains each response body before recording latency.
+
+| Scope | Workers | Queries | Errors | HTTP statuses | Wall time | RPS | avg | p50 | p95 | p99 |
+|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| Overall | 16 | 100 000 | 0 | 200:100000 | 3.028 s | 33 020.9 | 0.48 ms | 0.33 ms | 1.18 ms | 3.00 ms |
+| Single / NoFilter | 16 | 25 000 | 0 | 200 | - | - | 0.61 ms | 0.45 ms | 1.35 ms | 3.66 ms |
+| Single / Filter | 16 | 25 000 | 0 | 200 | - | - | 0.46 ms | 0.31 ms | 1.23 ms | 2.67 ms |
+| Multi / NoFilter | 16 | 25 000 | 0 | 200 | - | - | 0.43 ms | 0.29 ms | 1.09 ms | 3.32 ms |
+| Multi / Filter | 16 | 25 000 | 0 | 200 | - | - | 0.41 ms | 0.29 ms | 0.98 ms | 2.51 ms |
 
 ### In-process benchmark
 
@@ -48,6 +113,19 @@ Filter queries are faster than no-filter equivalents because the bitset pre-prun
 
 ---
 
+## Test Coverage
+
+Coverage is generated with `scripts/coverage.sh`. The script includes packages that have tests and excludes the benchmark/load-test CLI package (`cmd/bench`), including vocabulary generation and dataset benchmark helpers. Those files are operational tooling rather than library/runtime behavior, and otherwise show up as 0% in the total coverage report.
+
+```bash
+./scripts/coverage.sh coverage.out
+go tool cover -func=coverage.out
+```
+
+The GitHub Actions workflow uploads this filtered `coverage.out` to Codecov. To make the README badge work on GitHub, enable the repository in Codecov and add `CODECOV_TOKEN` as a GitHub Actions secret if Codecov requires it for the repo.
+
+---
+
 ## Quickstart
 
 ### Build & Run
@@ -55,6 +133,8 @@ Filter queries are faster than no-filter equivalents because the bitset pre-prun
 ```bash
 go run ./cmd/service
 ```
+
+The HTTP service listens on `:8080`.
 
 ### Docker
 
@@ -80,7 +160,7 @@ DataMap map[string]map[uint32]int
 // term → internalDocID → score
 ```
 
-Every document is tokenized from the configured `IndexFields`. Tokenization lowercases the text, strips every non-alphanumeric character (via a compiled regexp), and drops a fixed stop-word list (`a`, `the`, `and`). Each surviving token gets a score of `100 000 ÷ (total tokens in that document)`. If the same token appears multiple times its scores are summed, so denser matches rank higher. This single map is the only data structure the search hot-path reads.
+Every document is tokenized from the configured `IndexFields`. Tokenization lowercases the text, strips every non-alphanumeric character (via a compiled regexp), and drops a fixed stop-word list (`a`, `the`, `and`). Index fields can optionally define `fieldWeights`; missing or non-positive weights default to `1`. Each token receives a normalized score based on its field weight, so a token from a field with weight `3` is worth three times a token from a field with weight `1` while keeping the document's total score budget roughly stable. If the same token appears multiple times its scores are summed, so denser matches rank higher. `DataMap` is the primary posting-list and ranking structure used by the search hot path.
 
 ### 2. Internal IDs and Tombstones
 
@@ -93,16 +173,16 @@ Documents are identified internally by a monotonically increasing `uint32`:
 | `Documents` | internal ID → raw field map |
 | `DocDeleted` | internal ID → tombstoned? |
 
-**Update semantics**: updating a document assigns a new internal ID and sets `DocDeleted[oldID] = true`. The old posting-list entries are never removed; searches skip tombstoned IDs at scan time. This makes updates O(1) on the index at the cost of some wasted posting-list entries, which is the right trade-off for write-heavy workloads.
+**Update semantics**: updating a document assigns a new internal ID and sets `DocDeleted[oldID] = true`. The old posting-list entries are never removed; searches skip tombstoned IDs at scan time. This makes old-version cleanup O(1) at the cost of some wasted posting-list entries, while the new version is tokenized and indexed normally.
 
 ### 3. Prefix and Fuzzy Matching
 
 At index time, every new term seeds two auxiliary structures:
 
-- **`Prefix map[string][]string`** — maps every prefix of a term to a list of up to `MaxPrefixTerms` (400) completions. Lookup is a single map read — O(1). At query time the first 3 completions are used for single-term prefix search and up to 40 for the last token of a multi-term query.
+- **`Prefix map[string][]string`** — maps every prefix of a term to a hard-coded list of up to 5 000 completions. Lookup is a single map read — O(1). At query time the first 3 completions are used for single-term prefix search. Multi-term search uses an adaptive prefix count for the last token: 100 completions for 1-2 chars, 60 for 3-5 chars, and 50 after that.
 - **`SymSpell`** — a Levenshtein-distance index used for fuzzy suggestions when the query token has no prefix candidates (i.e. it is not a known prefix of any indexed term). Only terms with length ≥ 4 are added to SymSpell to avoid noise from very short tokens.
 
-Single-term search tries prefix candidates first (up to 3). If there are none it falls back to SymSpell suggestions. Multi-term search applies fuzzy expansion on all-but-last tokens, and prefix expansion on the last token (the partially-typed word), returning up to 40 prefix completions.
+Single-term search includes the exact term when it exists, then adds prefix candidates (up to 3). If there are no prefix candidates and no exact term, it falls back to SymSpell suggestions. Multi-term search applies exact + fuzzy expansion on all-but-last tokens, and exact + adaptive prefix expansion on the last token (the partially-typed word).
 
 ### 4. Bitset Filters
 
@@ -183,6 +263,7 @@ curl -X POST http://localhost:8080/create-index \
   -d '{
     "indexName":   "products",
     "indexFields": ["name", "tags"],
+    "fieldWeights": { "name": 3, "tags": 1 },
     "filters":     ["year"],
     "resultCount": 10
   }'
@@ -195,13 +276,23 @@ curl -X POST 'http://localhost:8080/add-to-index?indexName=products' \
   -F 'file=@docs.json'
 ```
 
-`docs.json` must be a JSON array:
+The uploaded file can be either a JSON array of objects or a CSV file with a header row. Every document should include an `id` field; documents without a usable `id` are skipped by the indexer.
+
+JSON example:
 
 ```json
 [
   { "id": "1", "name": "foo", "tags": ["a", "b"], "year": "2020" },
   { "id": "2", "name": "bar", "tags": ["c"],       "year": "2021" }
 ]
+```
+
+CSV example:
+
+```csv
+id,name,tags,year
+1,foo,a b,2020
+2,bar,c,2021
 ```
 
 ### 3. Search
@@ -233,6 +324,8 @@ curl -X POST 'http://localhost:8080/document?indexName=products' \
   }'
 ```
 
+`indexName` can also be sent in the JSON body instead of the query string.
+
 ### 5. Delete Single Document
 
 ```bash
@@ -246,6 +339,8 @@ curl -X POST http://localhost:8080/save-controller \
   -H 'Content-Type: application/json' \
   -d '{ "indexName": "products" }'
 ```
+
+Indexes are saved under `$INDEX_DATA_DIR/<indexName>/engine.gob`; if `INDEX_DATA_DIR` is not set, the service uses `./data`.
 
 ### 7. Load Index
 
@@ -276,8 +371,8 @@ go test -count=1 ./...
 # With race detection
 go test -race -count=1 ./...
 
-# With coverage
-go test -race -count=1 ./... -coverpkg=./... -coverprofile=coverage.out
+# With filtered coverage
+./scripts/coverage.sh coverage.out
 go tool cover -func=coverage.out
 ```
 
@@ -301,6 +396,13 @@ commands:
 
 ```bash
 go run ./cmd/bench vocab -size 100000 -out vocab.txt
+
+# Or extract vocabulary from a real JSON dataset
+go run ./cmd/bench vocab \
+  -data mb_5m.json \
+  -fields title,artist,album \
+  -size 100000 \
+  -out mb_vocab.txt
 ```
 
 | Flag | Default | Description |
@@ -308,6 +410,8 @@ go run ./cmd/bench vocab -size 100000 -out vocab.txt
 | `-size` | `100000` | Number of unique words |
 | `-out` | `vocab.txt` | Output file |
 | `-seed` | `42` | RNG seed |
+| `-data` | `""` | Optional JSON document file to extract vocabulary from |
+| `-fields` | `title,tags` | Comma-separated fields to extract when `-data` is set |
 
 ### Step 2 — generate documents
 
@@ -374,8 +478,7 @@ go run ./cmd/bench loadtest \
   -index bench \
   -requests 10000 \
   -workers 16 \
-  -filter-pct 50 \
-  -multi-pct 50
+  -mode-mix balanced
 ```
 
 | Flag | Default | Description |
@@ -387,11 +490,10 @@ go run ./cmd/bench loadtest \
 | `-requests` | `10000` | Total requests |
 | `-filter-pct` | `50` | % of requests with a year filter |
 | `-multi-pct` | `50` | % of multi-term queries |
+| `-mode-mix` | `random` | `random` uses `filter-pct`/`multi-pct`; `balanced` cycles evenly through the four benchmark modes |
 | `-timeout` | `10s` | Per-request HTTP timeout |
 | `-seed` | random | RNG seed for reproducibility |
 | `-keepalive` | `true` | Use HTTP keep-alive |
-
----
 
 ## License
 

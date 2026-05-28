@@ -33,17 +33,19 @@ type AddToIndexResponse struct {
 
 // CreateIndexRequest is the payload for creating index.
 type CreateIndexRequest struct {
-	IndexName   string   `json:"indexName"`
-	IndexFields []string `json:"indexFields"`
-	Filters     []string `json:"filters"`
-	ResultCount int      `json:"resultCount"`
+	IndexName    string         `json:"indexName"`
+	IndexFields  []string       `json:"indexFields"`
+	FieldWeights map[string]int `json:"fieldWeights"`
+	Filters      []string       `json:"filters"`
+	ResultCount  int            `json:"resultCount"`
 }
 
 // CreateIndexResponse is returned on succressful index creation.
 type CreateIndexResponse struct {
-	IndexName   string `json:"indexName"`
-	ResultCount int    `json:"resultCount"`
-	Duration    string `json:"duration"`
+	IndexName    string         `json:"indexName"`
+	ResultCount  int            `json:"resultCount"`
+	FieldWeights map[string]int `json:"fieldWeights"`
+	Duration     string         `json:"duration"`
 }
 
 // AddOrUpdateDocumentRequest is the payload for inserting/updating a single document.
@@ -189,8 +191,9 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	sec := engine.NewSearchEngine(
+	sec := engine.NewSearchEngineWithFieldWeights(
 		req.IndexFields,
+		req.FieldWeights,
 		filterMap,
 		req.ResultCount,
 	)
@@ -203,9 +206,10 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(CreateIndexResponse{
-		IndexName:   req.IndexName,
-		ResultCount: req.ResultCount,
-		Duration:    elapsed.String(),
+		IndexName:    req.IndexName,
+		ResultCount:  req.ResultCount,
+		FieldWeights: sec.FieldWeights,
+		Duration:     elapsed.String(),
 	})
 }
 

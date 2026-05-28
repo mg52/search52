@@ -25,7 +25,15 @@ go.work.sum
 
 **/data/
 
+# Extensionless generated files, e.g. extracted MusicBrainz table dumps.
+*
+!*/
+!*.*
+
 *backup*
 
 *.json
 *.txt
+*.out
+*.bz2
+*.py

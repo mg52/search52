@@ -16,6 +16,24 @@ import (
 	"github.com/mg52/search/internal/engine"
 )
 
+func assertEngineSearchIDs(t *testing.T, docs []engine.ReturnedDocument, exp ...string) {
+	t.Helper()
+	got := make([]string, 0, len(docs))
+	for _, doc := range docs {
+		got = append(got, doc.ID)
+	}
+	sort.Strings(got)
+	sort.Strings(exp)
+	if len(got) != len(exp) {
+		t.Fatalf("ids mismatch: got=%v exp=%v", got, exp)
+	}
+	for i := range got {
+		if got[i] != exp[i] {
+			t.Fatalf("ids mismatch: got=%v exp=%v", got, exp)
+		}
+	}
+}
+
 func TestCreateIndexHandler(t *testing.T) {
 	h := NewHTTP()
 	// Valid create-index request
@@ -35,6 +53,53 @@ func TestCreateIndexHandler(t *testing.T) {
 	}
 	if resp.IndexName != "testidx" {
 		t.Errorf("expected IndexName=testidx; got %q", resp.IndexName)
+	}
+	if resp.FieldWeights["name"] != 1 {
+		t.Errorf("expected default name field weight 1; got %d", resp.FieldWeights["name"])
+	}
+}
+
+func TestCreateIndexHandler_FieldWeights(t *testing.T) {
+	h := NewHTTP()
+	body := `{
+		"indexName":"weightedidx",
+		"indexFields":["title","artist","album"],
+		"fieldWeights":{"title":5,"artist":2,"album":0,"ignored":9},
+		"filters":["year"],
+		"resultCount":5
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.CreateIndex(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected status 201 Created; got %d", rr.Code)
+	}
+
+	var resp CreateIndexResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if resp.FieldWeights["title"] != 5 {
+		t.Fatalf("expected title weight 5; got %+v", resp.FieldWeights)
+	}
+	if resp.FieldWeights["artist"] != 2 {
+		t.Fatalf("expected artist weight 2; got %+v", resp.FieldWeights)
+	}
+	if resp.FieldWeights["album"] != 1 {
+		t.Fatalf("expected invalid album weight to default to 1; got %+v", resp.FieldWeights)
+	}
+	if _, ok := resp.FieldWeights["ignored"]; ok {
+		t.Fatalf("expected non-index field weight to be ignored; got %+v", resp.FieldWeights)
+	}
+
+	created := h.engines["weightedidx"]
+	if created == nil {
+		t.Fatalf("expected weightedidx engine to be registered")
+	}
+	if created.FieldWeights["title"] != 5 || created.FieldWeights["artist"] != 2 || created.FieldWeights["album"] != 1 {
+		t.Fatalf("engine field weights mismatch: %+v", created.FieldWeights)
 	}
 }
 
@@ -143,6 +208,92 @@ func TestSaveEngine_Success(t *testing.T) {
 	}
 }
 
+func TestLoadEngine_Errors(t *testing.T) {
+	h := NewHTTP()
+
+	req := httptest.NewRequest(http.MethodGet, "/load-controller", nil)
+	rr := httptest.NewRecorder()
+	h.LoadEngine(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /load-controller expected 405, got %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/load-controller", strings.NewReader("{bad json}"))
+	rr = httptest.NewRecorder()
+	h.LoadEngine(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("POST /load-controller invalid JSON expected 400, got %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/load-controller", strings.NewReader(`{}`))
+	rr = httptest.NewRecorder()
+	h.LoadEngine(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("POST /load-controller missing indexName expected 400, got %d", rr.Code)
+	}
+
+	t.Setenv("INDEX_DATA_DIR", t.TempDir())
+	req = httptest.NewRequest(http.MethodPost, "/load-controller", strings.NewReader(`{"indexName":"missing"}`))
+	rr = httptest.NewRecorder()
+	h.LoadEngine(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("POST /load-controller missing engine expected 500, got %d", rr.Code)
+	}
+}
+
+func TestLoadEngine_Success(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("INDEX_DATA_DIR", tmp)
+
+	se := engine.NewSearchEngineWithFieldWeights(
+		[]string{"name", "tags"},
+		map[string]int{"name": 3, "tags": 1},
+		map[string]bool{"year": true},
+		10,
+	)
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":   "1",
+		"name": "Sunny Rio",
+		"tags": "music",
+		"year": "2020",
+	}); err != nil {
+		t.Fatalf("AddOrUpdateDocument: %v", err)
+	}
+
+	dataDir := filepath.Join(tmp, "idx")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := se.SaveAll(dataDir); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+
+	h := NewHTTP()
+	req := httptest.NewRequest(http.MethodPost, "/load-controller", strings.NewReader(`{"indexName":"idx"}`))
+	rr := httptest.NewRecorder()
+	h.LoadEngine(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["indexName"] != "idx" {
+		t.Fatalf("expected indexName idx, got %v", resp["indexName"])
+	}
+	loaded := h.engines["idx"]
+	if loaded == nil {
+		t.Fatalf("expected engine to be registered")
+	}
+	if loaded.FieldWeights["name"] != 3 || loaded.FieldWeights["tags"] != 1 {
+		t.Fatalf("expected restored field weights, got %+v", loaded.FieldWeights)
+	}
+	assertEngineSearchIDs(t, loaded.SearchOneTerm("sunny", nil), "1")
+	assertEngineSearchIDs(t, loaded.SearchOneTerm("sunny", map[string][]interface{}{"year": {"2020"}}), "1")
+}
+
 func TestSearchHandler_Errors(t *testing.T) {
 	h := NewHTTP()
 	// Method not allowed
@@ -242,6 +393,95 @@ func TestAddToIndexHandler_Errors(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("POST /add-to-index missing file expected 400, got %d", rr.Code)
 	}
+
+	// Multipart file with invalid JSON and invalid CSV
+	buf.Reset()
+	mw = multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile("file", "bad.txt")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := part.Write([]byte("not json and not csv")); err != nil {
+		t.Fatalf("write multipart file: %v", err)
+	}
+	mw.Close()
+	req = httptest.NewRequest(http.MethodPost, "/add-to-index?indexName=idx", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr = httptest.NewRecorder()
+	h.AddToIndex(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("POST /add-to-index invalid upload expected 400, got %d", rr.Code)
+	}
+}
+
+func TestAddToIndexHandler_JSONSuccess(t *testing.T) {
+	h := NewHTTP()
+	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile("file", "docs.json")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := part.Write([]byte(`[
+		{"id":"1","name":"Sunny Rio","year":"2020"},
+		{"id":"2","name":"Cloudy Day","year":"2021"}
+	]`)); err != nil {
+		t.Fatalf("write multipart file: %v", err)
+	}
+	mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/add-to-index?indexName=idx", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	h.AddToIndex(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp AddToIndexResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.AddedCount != 2 || resp.TotalDocs != 2 {
+		t.Fatalf("unexpected add response: %+v", resp)
+	}
+	assertEngineSearchIDs(t, h.engines["idx"].SearchOneTerm("sunny", nil), "1")
+	assertEngineSearchIDs(t, h.engines["idx"].SearchOneTerm("cloudy", nil), "2")
+}
+
+func TestAddToIndexHandler_CSVSuccess(t *testing.T) {
+	h := NewHTTP()
+	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile("file", "docs.csv")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := part.Write([]byte("id,name,year\n1,Sunny Rio,2020\n2,Cloudy Day,2021\n")); err != nil {
+		t.Fatalf("write multipart file: %v", err)
+	}
+	mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/add-to-index?indexName=idx", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	h.AddToIndex(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp AddToIndexResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.AddedCount != 2 || resp.TotalDocs != 2 {
+		t.Fatalf("unexpected add response: %+v", resp)
+	}
+	assertEngineSearchIDs(t, h.engines["idx"].SearchOneTerm("rio", nil), "1")
 }
 
 func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {

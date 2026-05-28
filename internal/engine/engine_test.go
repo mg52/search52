@@ -4,35 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"testing"
 )
-
-// helper to build a SearchEngine with prepopulated FilterBits
-func newTestEngineWithData(data map[string][]uint64) *SearchEngine {
-	return &SearchEngine{
-		mu:         sync.RWMutex{},
-		FilterBits: data,
-		DocDeleted: make(map[uint32]bool),
-		ResultSize: 100,
-	}
-}
-
-func TestApplyFilter_SingleValue(t *testing.T) {
-	bits := make(map[string][]uint64)
-	bits["author:Alice"] = filterBitSet(bits["author:Alice"], 1)
-	bits["author:Alice"] = filterBitSet(bits["author:Alice"], 2)
-	se := newTestEngineWithData(bits)
-
-	filters := map[string][]interface{}{"author": {"Alice"}}
-	got := se.ApplyFilter(filters)
-	if got == nil {
-		t.Fatal("expected non-nil bitset")
-	}
-	if !filterBitTest(got, 1) || !filterBitTest(got, 2) {
-		t.Errorf("expected ids 1 and 2 to be set in bitset, got %v", got)
-	}
-}
 
 func newTestEngine() *SearchEngine {
 	se := &SearchEngine{
@@ -868,6 +841,190 @@ func Test_E2E(t *testing.T) {
 	}
 }
 
+func TestWeightedFields_SearchUpdateDelete_E2E(t *testing.T) {
+	se := NewSearchEngineWithFieldWeights(
+		[]string{"title", "description"},
+		map[string]int{"title": 5, "description": 1},
+		map[string]bool{"category": true},
+		10,
+	)
+
+	docs := []map[string]interface{}{
+		{
+			"id":          "title-hit",
+			"title":       "blue train",
+			"description": "quiet",
+			"category":    "music",
+		},
+		{
+			"id":          "description-hit",
+			"title":       "quiet",
+			"description": "blue train",
+			"category":    "music",
+		},
+		{
+			"id":          "filtered-title-hit",
+			"title":       "blue train",
+			"description": "quiet",
+			"category":    "book",
+		},
+	}
+
+	se.Index(docs)
+
+	res := se.Search("blue", map[string][]interface{}{"category": {"music"}})
+	if res == nil {
+		t.Fatalf("Search returned nil")
+	}
+	if len(res.Docs) != 2 {
+		t.Fatalf("expected 2 music docs for blue, got %d: %+v", len(res.Docs), res.Docs)
+	}
+	if res.Docs[0].ID != "title-hit" {
+		t.Fatalf("expected title-weighted doc first, got %+v", res.Docs)
+	}
+	if res.Docs[0].Score <= res.Docs[1].Score {
+		t.Fatalf("expected title hit score > description hit score, got %+v", res.Docs)
+	}
+
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":          "description-hit",
+		"title":       "blue",
+		"description": "quiet",
+		"category":    "music",
+	}); err != nil {
+		t.Fatalf("AddOrUpdateDocument weighted update: %v", err)
+	}
+
+	res = se.Search("blue", map[string][]interface{}{"category": {"music"}})
+	if res == nil {
+		t.Fatalf("Search after update returned nil")
+	}
+	if len(res.Docs) != 2 {
+		t.Fatalf("expected 2 music docs after update, got %d: %+v", len(res.Docs), res.Docs)
+	}
+	if res.Docs[0].ID != "description-hit" {
+		t.Fatalf("expected updated title-weighted doc first, got %+v", res.Docs)
+	}
+
+	if ok := se.DeleteDocument("description-hit"); !ok {
+		t.Fatalf("DeleteDocument(description-hit) expected true")
+	}
+
+	res = se.Search("blue", map[string][]interface{}{"category": {"music"}})
+	if res == nil {
+		t.Fatalf("Search after delete returned nil")
+	}
+	assertIDs(t, res.Docs, "title-hit")
+
+	res = se.Search("blue", map[string][]interface{}{"category": {"book"}})
+	if res == nil {
+		t.Fatalf("Search with book filter returned nil")
+	}
+	assertIDs(t, res.Docs, "filtered-title-hit")
+}
+
+func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
+	se := NewSearchEngineWithFieldWeights(
+		[]string{"title", "artist", "album"},
+		map[string]int{"title": 6, "artist": 3, "album": 1},
+		map[string]bool{"kind": true},
+		10,
+	)
+
+	docs := []map[string]interface{}{
+		{
+			"id":     "title-match",
+			"title":  "iron maiden",
+			"artist": "tribute act",
+			"album":  "live archive",
+			"kind":   "track",
+		},
+		{
+			"id":     "artist-match",
+			"title":  "number beast",
+			"artist": "iron maiden",
+			"album":  "classic metal",
+			"kind":   "track",
+		},
+		{
+			"id":     "album-match",
+			"title":  "running free",
+			"artist": "cover band",
+			"album":  "iron maiden",
+			"kind":   "track",
+		},
+		{
+			"id":     "filtered-match",
+			"title":  "iron maiden",
+			"artist": "archive",
+			"album":  "spoken word",
+			"kind":   "podcast",
+		},
+	}
+
+	se.Index(docs)
+
+	res := se.Search("iron", map[string][]interface{}{"kind": {"track"}})
+	if res == nil {
+		t.Fatalf("Search returned nil")
+	}
+	if len(res.Docs) != 3 {
+		t.Fatalf("expected 3 track docs for iron, got %d: %+v", len(res.Docs), res.Docs)
+	}
+
+	expectedOrder := []string{"title-match", "artist-match", "album-match"}
+	for i, expectedID := range expectedOrder {
+		if res.Docs[i].ID != expectedID {
+			t.Fatalf("unexpected weighted order before load: got %+v expected=%v", res.Docs, expectedOrder)
+		}
+	}
+
+	multi := se.Search("iron mai", map[string][]interface{}{"kind": {"track"}})
+	if multi == nil {
+		t.Fatalf("Multi-term Search returned nil")
+	}
+	if len(multi.Docs) != 3 {
+		t.Fatalf("expected 3 track docs for iron mai, got %d: %+v", len(multi.Docs), multi.Docs)
+	}
+	for i, expectedID := range expectedOrder {
+		if multi.Docs[i].ID != expectedID {
+			t.Fatalf("unexpected weighted multi-term order before load: got %+v expected=%v", multi.Docs, expectedOrder)
+		}
+	}
+
+	dir := t.TempDir()
+	if err := se.SaveAll(dir); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+
+	loaded, err := LoadAll(dir)
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+	if loaded.FieldWeights["title"] != 6 || loaded.FieldWeights["artist"] != 3 || loaded.FieldWeights["album"] != 1 {
+		t.Fatalf("field weights were not restored: %+v", loaded.FieldWeights)
+	}
+
+	res = loaded.Search("iron", map[string][]interface{}{"kind": {"track"}})
+	if res == nil {
+		t.Fatalf("loaded Search returned nil")
+	}
+	if len(res.Docs) != 3 {
+		t.Fatalf("expected 3 loaded track docs for iron, got %d: %+v", len(res.Docs), res.Docs)
+	}
+	for i, expectedID := range expectedOrder {
+		if res.Docs[i].ID != expectedID {
+			t.Fatalf("unexpected weighted order after load: got %+v expected=%v", res.Docs, expectedOrder)
+		}
+	}
+
+	filtered := loaded.Search("iron", map[string][]interface{}{"kind": {"podcast"}})
+	if filtered == nil {
+		t.Fatalf("loaded filtered Search returned nil")
+	}
+	assertIDs(t, filtered.Docs, "filtered-match")
+}
+
 func TestIndex_MultipleBatches(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title", "tags"},
@@ -947,138 +1104,6 @@ func TestIndex_MultipleBatches(t *testing.T) {
 			t.Fatalf("expected doc %s for query %q, got %+v",
 				tt.expectedID, tt.query, res.Docs)
 		}
-	}
-}
-
-func TestMinHeap_PushPopOrder(t *testing.T) {
-	var h []internalHit
-
-	input := []internalHit{
-		{id: 1, score: 50},
-		{id: 2, score: 10},
-		{id: 3, score: 30},
-		{id: 4, score: 5},
-		{id: 5, score: 20},
-	}
-
-	for _, v := range input {
-		h = heapPushHit(h, v)
-	}
-
-	n := len(h)
-	out := make([]internalHit, n)
-	for i := n - 1; i >= 0; i-- {
-		hit := h[0]
-		if i > 0 {
-			h[0] = h[i]
-			siftDownHit(h, 0, i)
-		}
-		out[i] = hit
-	}
-
-	expectedOrder := []int{50, 30, 20, 10, 5}
-	for i, want := range expectedOrder {
-		if out[i].score != want {
-			t.Errorf("index %d: expected %v, got %v", i, want, out[i].score)
-		}
-	}
-}
-
-func TestMinHeap_Len(t *testing.T) {
-	var h []internalHit
-
-	if len(h) != 0 {
-		t.Fatalf("expected empty heap")
-	}
-
-	h = heapPushHit(h, internalHit{id: 1, score: 10})
-	h = heapPushHit(h, internalHit{id: 2, score: 20})
-
-	if len(h) != 2 {
-		t.Fatalf("expected len 2, got %d", len(h))
-	}
-}
-
-func TestMinHeap_SingleElement(t *testing.T) {
-	var h []internalHit
-
-	h = heapPushHit(h, internalHit{id: 1, score: 42})
-
-	n := len(h)
-	out := make([]internalHit, n)
-	for i := n - 1; i >= 0; i-- {
-		hit := h[0]
-		if i > 0 {
-			h[0] = h[i]
-			siftDownHit(h, 0, i)
-		}
-		out[i] = hit
-	}
-
-	if out[0].score != 42 {
-		t.Errorf("expected 42, got %v", out[0].score)
-	}
-}
-
-func TestMinHeap_StabilityRandomInsertions(t *testing.T) {
-	var h []internalHit
-
-	values := []int{100, 1, 50, 2, 99, 3, 75, 4, 60}
-
-	for i, v := range values {
-		h = heapPushHit(h, internalHit{id: uint32(i), score: v})
-	}
-
-	n := len(h)
-	out := make([]internalHit, n)
-	for i := n - 1; i >= 0; i-- {
-		hit := h[0]
-		if i > 0 {
-			h[0] = h[i]
-			siftDownHit(h, 0, i)
-		}
-		out[i] = hit
-	}
-
-	for i := 1; i < len(out); i++ {
-		if out[i].score > out[i-1].score {
-			t.Errorf("heap order violated at index %d: %v > %v", i, out[i].score, out[i-1].score)
-		}
-	}
-}
-
-func TestMinHeap_StabilityRandomInsertions2(t *testing.T) {
-	var h []internalHit
-
-	values := []int{100, 105, 1, 50, 2, 99, 101, 3, 75, 4, 60, 104, 110, 95, 90, 90, 106, 8, 111, 101, 106, 79}
-
-	k := 5
-	for i, score := range values {
-		if len(h) < k {
-			h = heapPushHit(h, internalHit{id: uint32(i), score: score})
-		} else if h[0].score < score {
-			heapReplaceTop(h, internalHit{id: uint32(i), score: score})
-		}
-	}
-
-	n := len(h)
-	scores := make([]int, n)
-	for i := n - 1; i >= 0; i-- {
-		hit := h[0]
-		if i > 0 {
-			h[0] = h[i]
-			siftDownHit(h, 0, i)
-		}
-		scores[i] = hit.score
-	}
-
-	for i := 1; i < len(scores); i++ {
-		if scores[i] > scores[i-1] {
-			t.Errorf("heap order violated at index %d: %v > %v", i, scores[i], scores[i-1])
-		}
-	}
-	if scores[0] != 111 || scores[1] != 110 || scores[2] != 106 || scores[3] != 106 || scores[4] != 105 {
-		t.Errorf("Score violated: got %v", scores)
 	}
 }
 

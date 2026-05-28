@@ -9,111 +9,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/mg52/search/internal/symspell"
 )
-
-const MaxPrefixTerms = 5_000
-
-type internalHit struct {
-	id    uint32
-	score int
-}
-
-// Specialized min-heap over []internalHit. Inlined sift operations avoid the
-// interface dispatch and any-boxing overhead of container/heap, which matters
-// in the per-document inner loops of search.
-
-// heapPushHit appends hit and sifts it up. Returns the new slice header.
-func heapPushHit(h []internalHit, hit internalHit) []internalHit {
-	h = append(h, hit)
-	i := len(h) - 1
-	for i > 0 {
-		parent := (i - 1) >> 1
-		if h[parent].score <= h[i].score {
-			break
-		}
-		h[parent], h[i] = h[i], h[parent]
-		i = parent
-	}
-	return h
-}
-
-// heapReplaceTop overwrites the root and sifts it down — one operation
-// instead of pop+push when the heap is already at capacity. len(h) > 0.
-func heapReplaceTop(h []internalHit, hit internalHit) {
-	h[0] = hit
-	siftDownHit(h, 0, len(h))
-}
-
-func siftDownHit(h []internalHit, start, n int) {
-	i := start
-	for {
-		left := 2*i + 1
-		if left >= n {
-			return
-		}
-		smallest := left
-		if right := left + 1; right < n && h[right].score < h[left].score {
-			smallest = right
-		}
-		if h[i].score <= h[smallest].score {
-			return
-		}
-		h[i], h[smallest] = h[smallest], h[i]
-		i = smallest
-	}
-}
-
-// ---- filter bitset helpers ----
-// Bitsets are indexed by internalDocID: word = id>>6, bit = id&63.
-// filterBitSet grows bits as needed and sets the bit for id.
-func filterBitSet(bits []uint64, id uint32) []uint64 {
-	word := id >> 6
-	for uint32(len(bits)) <= word {
-		bits = append(bits, 0)
-	}
-	bits[word] |= 1 << (id & 63)
-	return bits
-}
-
-func filterBitTest(bits []uint64, id uint32) bool {
-	word := id >> 6
-	return uint32(len(bits)) > word && bits[word]&(1<<(id&63)) != 0
-}
-
-// filterBitOr returns a new bitset that is the union of a and b.
-func filterBitOr(a, b []uint64) []uint64 {
-	if len(b) > len(a) {
-		a, b = b, a
-	}
-	out := make([]uint64, len(a))
-	copy(out, a)
-	for i := range b {
-		out[i] |= b[i]
-	}
-	return out
-}
-
-// filterBitAnd returns a new bitset that is the intersection of a and b.
-func filterBitAnd(a, b []uint64) []uint64 {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	out := make([]uint64, n)
-	for i := range out {
-		out[i] = a[i] & b[i]
-	}
-	return out
-}
-
-// nonAlphaNumeric is compiled once and reused by Tokenize.
-var nonAlphaNumeric = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
 type Document struct {
 	ID    string
@@ -130,14 +30,6 @@ type SearchResult struct {
 	Docs []ReturnedDocument
 }
 
-// TODO: make it a variable
-// stopWords lists very common words excluded from indexing.
-var stopWords = map[string]bool{
-	"a":   true,
-	"the": true,
-	"and": true,
-}
-
 // enginePayload is the gob-serializable snapshot of SearchEngine state.
 type enginePayload struct {
 	Documents          map[uint32]map[string]interface{}
@@ -146,6 +38,7 @@ type enginePayload struct {
 	InternalToExternal map[uint32]string
 	NextInternalID     uint32
 	IndexFields        []string
+	FieldWeights       map[string]int
 	Filters            map[string]bool
 	ResultSize         int
 }
@@ -163,13 +56,14 @@ type SearchEngine struct {
 	nextInternalID     uint32
 
 	// Docs + filters
-	Documents   map[uint32]map[string]interface{} // internalDocID -> doc fields
-	FilterBits  map[string][]uint64               // "field:value" -> bitset of internalDocIDs
-	Prefix      map[string][]string               // prefix -> matching terms (capped at MaxPrefixTerms)
-	Symspell    *symspell.SymSpell
-	IndexFields []string
-	Filters     map[string]bool
-	ResultSize  int
+	Documents    map[uint32]map[string]interface{} // internalDocID -> doc fields
+	FilterBits   map[string][]uint64               // "field:value" -> bitset of internalDocIDs
+	Prefix       map[string][]string               // prefix -> matching terms (capped at MaxPrefixTerms)
+	Symspell     *symspell.SymSpell
+	IndexFields  []string
+	FieldWeights map[string]int
+	Filters      map[string]bool
+	ResultSize   int
 
 	// termSet is a lock-free set of all indexed terms, used for O(1) existence
 	// checks in the search path without touching se.mu.
@@ -180,6 +74,12 @@ type SearchEngine struct {
 
 // NewSearchEngine constructs a new, empty engine ready to index documents.
 func NewSearchEngine(indexFields []string, filters map[string]bool, resultSize int) *SearchEngine {
+	return NewSearchEngineWithFieldWeights(indexFields, nil, filters, resultSize)
+}
+
+// NewSearchEngineWithFieldWeights constructs a new engine with per-index-field
+// scoring weights. Missing or non-positive weights default to 1.
+func NewSearchEngineWithFieldWeights(indexFields []string, fieldWeights map[string]int, filters map[string]bool, resultSize int) *SearchEngine {
 	return &SearchEngine{
 		DataMap:            make(map[string]map[uint32]int),
 		DocDeleted:         make(map[uint32]bool),
@@ -187,8 +87,9 @@ func NewSearchEngine(indexFields []string, filters map[string]bool, resultSize i
 		InternalToExternal: make(map[uint32]string),
 		nextInternalID:     1,
 		Documents:          make(map[uint32]map[string]interface{}),
-		IndexFields:        indexFields,
-		Filters:            filters,
+		IndexFields:        append([]string(nil), indexFields...),
+		FieldWeights:       normalizeFieldWeights(indexFields, fieldWeights),
+		Filters:            copyBoolMap(filters),
 		Prefix:             make(map[string][]string),
 		Symspell:           symspell.NewSymSpell(),
 		FilterBits:         make(map[string][]uint64),
@@ -219,6 +120,7 @@ func (se *SearchEngine) SaveAll(path string) error {
 		InternalToExternal: se.InternalToExternal,
 		NextInternalID:     se.nextInternalID,
 		IndexFields:        se.IndexFields,
+		FieldWeights:       se.FieldWeights,
 		Filters:            se.Filters,
 		ResultSize:         se.ResultSize,
 	}
@@ -265,6 +167,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 		Prefix:             make(map[string][]string),
 		Symspell:           symspell.NewSymSpell(),
 		IndexFields:        nil,
+		FieldWeights:       make(map[string]int),
 		Filters:            make(map[string]bool),
 		ResultSize:         100,
 	}
@@ -276,6 +179,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 	se.InternalToExternal = payload.InternalToExternal
 	se.nextInternalID = payload.NextInternalID
 	se.IndexFields = payload.IndexFields
+	se.FieldWeights = normalizeFieldWeights(se.IndexFields, payload.FieldWeights)
 	se.Filters = payload.Filters
 	se.ResultSize = payload.ResultSize
 
@@ -320,38 +224,9 @@ func LoadAll(path string) (*SearchEngine, error) {
 			continue
 		}
 
-		// Collect tokens from index fields
-		var allTokens []string
-		for _, field := range se.IndexFields {
-			val, ok := doc[field]
-			if !ok {
-				continue
-			}
-			switch v := val.(type) {
-			case string:
-				allTokens = append(allTokens, Tokenize(v)...)
-			case []string:
-				for _, s := range v {
-					allTokens = append(allTokens, Tokenize(s)...)
-				}
-			case []interface{}:
-				for _, item := range v {
-					if s, ok := item.(string); ok {
-						allTokens = append(allTokens, Tokenize(s)...)
-					}
-				}
-			}
-		}
-
-		if len(allTokens) == 0 {
+		localScores := weightedTokenScores(doc, se.IndexFields, se.FieldWeights)
+		if len(localScores) == 0 {
 			continue
-		}
-
-		// Aggregate token scores locally, then write under one lock.
-		normalizedScore := 100_000 / len(allTokens)
-		localScores := make(map[string]int, len(allTokens))
-		for _, token := range allTokens {
-			localScores[token] += normalizedScore
 		}
 
 		se.mu.Lock()
@@ -483,6 +358,7 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 		internal, ok := se.ExternalToInternal[extID]
 		deleted := ok && se.DocDeleted[internal]
 		indexFields := se.IndexFields
+		fieldWeights := se.FieldWeights
 		filters := se.Filters
 		se.mu.RUnlock()
 
@@ -490,36 +366,9 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 			continue
 		}
 
-		// ---- tokenize without lock ----
-		var allTokens []string
-		for _, field := range indexFields {
-			if value, exists := doc[field]; exists {
-				switch v := value.(type) {
-				case string:
-					allTokens = append(allTokens, Tokenize(v)...)
-				case []string:
-					for _, item := range v {
-						allTokens = append(allTokens, Tokenize(item)...)
-					}
-				case []interface{}:
-					for _, item := range v {
-						if str, ok := item.(string); ok {
-							allTokens = append(allTokens, Tokenize(str)...)
-						}
-					}
-				}
-			}
-		}
-
-		if len(allTokens) == 0 {
+		localScores := weightedTokenScores(doc, indexFields, fieldWeights)
+		if len(localScores) == 0 {
 			continue
-		}
-
-		// Aggregate token scores locally (no lock needed).
-		normalizedScore := 100_000 / len(allTokens)
-		localScores := make(map[string]int, len(allTokens))
-		for _, token := range allTokens {
-			localScores[token] += normalizedScore
 		}
 
 		// Write everything under a single lock.
@@ -951,7 +800,7 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[strin
 }
 
 // MultiTermSearch executes a multi-token query using grouped boolean search strategies.
-// First terms: exact match + fuzzy(10). Last term: exact match + prefix(40).
+// First terms: exact match + fuzzy(10). Last term: exact match + adaptive prefix expansion.
 func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string][]interface{}) *SearchResult {
 	lastQueryIndex := len(queryTokens) - 1
 	rawFirstTerms := queryTokens[:lastQueryIndex]
@@ -961,8 +810,7 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string
 
 	_, lastExists := se.termSet.Load(rawLastTerm)
 	se.mu.RLock()
-	// TODO: make it var in the engine definition
-	maxPrefix := 40
+	maxPrefix := prefixLimitForQuery(rawLastTerm)
 	if len(se.Prefix[rawLastTerm]) < maxPrefix {
 		maxPrefix = len(se.Prefix[rawLastTerm])
 	}
@@ -1005,41 +853,14 @@ func (se *SearchEngine) AddOrUpdateDocument(doc map[string]interface{}) error {
 	// 1) Resolve fields used for indexing/filtering (read-lock)
 	se.mu.RLock()
 	indexFields := append([]string(nil), se.IndexFields...)
+	fieldWeights := copyIntMap(se.FieldWeights)
 	filters := se.Filters
 	se.mu.RUnlock()
 
-	// 2) Tokenize without holding locks
-	var allTokens []string
-	for _, weightField := range indexFields {
-		if value, exists := doc[weightField]; exists {
-			switch v := value.(type) {
-			case string:
-				allTokens = append(allTokens, Tokenize(v)...)
-			case []string:
-				for _, item := range v {
-					allTokens = append(allTokens, Tokenize(item)...)
-				}
-			case []interface{}:
-				for _, item := range v {
-					if str, ok := item.(string); ok {
-						allTokens = append(allTokens, Tokenize(str)...)
-					}
-				}
-			}
-		}
-	}
+	// 2) Tokenize and aggregate token scores without holding locks.
+	localScores := weightedTokenScores(doc, indexFields, fieldWeights)
 
-	// 3) Aggregate token scores locally
-	var localScores map[string]int
-	if len(allTokens) > 0 {
-		normalizedScore := 100_000 / len(allTokens)
-		localScores = make(map[string]int, len(allTokens))
-		for _, token := range allTokens {
-			localScores[token] += normalizedScore
-		}
-	}
-
-	// 4) Assign new internal ID, store doc, write tokens and filters under one lock
+	// 3) Assign new internal ID, store doc, write tokens and filters under one lock
 	se.mu.Lock()
 
 	if oldInternal, exists := se.ExternalToInternal[extID]; exists {
@@ -1101,17 +922,4 @@ func (se *SearchEngine) DeleteDocument(externalID string) bool {
 	se.DocDeleted[internal] = true
 
 	return true
-}
-
-// Tokenize splits text into tokens by lowercasing, stripping non-alphanumeric, dropping stopwords.
-func Tokenize(content string) []string {
-	words := strings.Fields(content)
-	var tokens []string
-	for _, word := range words {
-		word = nonAlphaNumeric.ReplaceAllString(strings.ToLower(word), "")
-		if word != "" && !stopWords[word] {
-			tokens = append(tokens, word)
-		}
-	}
-	return tokens
 }
