@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Search52 Admin</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f7f8fa; color: #16181d; }
+    header { padding: 18px 28px; background: #fff; border-bottom: 1px solid #dfe3ea; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: 20px; font-weight: 700; }
+    main { max-width: 1280px; margin: 0 auto; padding: 22px; display: grid; gap: 18px; }
+    section { background: #fff; border: 1px solid #dfe3ea; border-radius: 8px; padding: 18px; }
+    h2 { margin: 0 0 14px; font-size: 16px; }
+    label { display: block; font-size: 12px; font-weight: 700; color: #525a67; margin: 10px 0 6px; }
+    input, textarea { width: 100%; border: 1px solid #cbd2dd; border-radius: 6px; padding: 10px 11px; font: inherit; background: #fff; }
+    textarea { min-height: 92px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+    button { border: 0; border-radius: 6px; background: #1458d4; color: #fff; font-weight: 700; padding: 10px 14px; cursor: pointer; }
+    button.secondary { background: #ecf0f6; color: #182131; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .row { display: flex; gap: 10px; align-items: end; }
+    .row > * { flex: 1; }
+    .tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+    .tab-button { background: #ecf0f6; color: #182131; }
+    .tab-button.active { background: #1458d4; color: #fff; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid #edf0f4; padding: 9px; text-align: left; vertical-align: top; }
+    th { color: #525a67; font-size: 12px; background: #fafbfc; }
+    pre { margin: 0; white-space: pre-wrap; overflow: auto; max-height: 420px; background: #101522; color: #d7e0f4; padding: 14px; border-radius: 8px; font-size: 12px; }
+    .status { font-size: 13px; color: #525a67; }
+    .toolbar { display: flex; gap: 10px; align-items: center; }
+    @media (max-width: 900px) { header { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Search52 Admin</h1>
+    <div class="toolbar">
+      <span id="status" class="status">Ready</span>
+      <button class="secondary" onclick="refreshIndexes()">Refresh</button>
+    </div>
+  </header>
+  <main>
+    <nav class="tabs" aria-label="Admin tabs">
+      <button class="tab-button active" data-tab="indexes" onclick="openTab('indexes')">Indexes</button>
+      <button class="tab-button" data-tab="create" onclick="openTab('create')">Create Index</button>
+      <button class="tab-button" data-tab="add" onclick="openTab('add')">Add Document</button>
+      <button class="tab-button" data-tab="delete" onclick="openTab('delete')">Delete Document</button>
+      <button class="tab-button" data-tab="search" onclick="openTab('search')">Search</button>
+      <button class="tab-button" data-tab="save" onclick="openTab('save')">Save Index</button>
+      <button class="tab-button" data-tab="load" onclick="openTab('load')">Load Index</button>
+      <button class="tab-button" data-tab="compact" onclick="openTab('compact')">Compact Index</button>
+    </nav>
+    <section id="tab-indexes" class="tab-panel active">
+      <h2>Indexes</h2>
+      <div id="indexes"></div>
+    </section>
+    <section id="tab-create" class="tab-panel">
+      <h2>Create Index</h2>
+      <label>Index name</label>
+      <input id="createName" placeholder="products">
+      <label>Index fields</label>
+      <input id="createFields" placeholder="name,tags">
+      <label>Field weights JSON</label>
+      <textarea id="createWeights" placeholder='{"name":3,"tags":1}'></textarea>
+      <label>Filters</label>
+      <input id="createFilters" placeholder="year,category">
+      <label>Result count</label>
+      <input id="createResultCount" type="number" value="100">
+      <p><button onclick="createIndex()">Create</button></p>
+    </section>
+    <section id="tab-add" class="tab-panel">
+      <h2>Add Document</h2>
+      <label>Index name</label>
+      <input id="docIndex" placeholder="products">
+      <label>Document JSON</label>
+      <textarea id="docBody">{"id":"1","name":"example","tags":["demo"],"year":"2026"}</textarea>
+      <p><button onclick="addDocument()">Add / Update</button></p>
+    </section>
+    <section id="tab-delete" class="tab-panel">
+      <h2>Delete Document</h2>
+      <label>Index name</label>
+      <input id="deleteIndex" placeholder="products">
+      <label>Document ID</label>
+      <input id="deleteID" placeholder="14">
+      <p><button onclick="deleteDocument()">Delete</button></p>
+    </section>
+    <section id="tab-search" class="tab-panel">
+      <h2>Search</h2>
+      <label>Index name</label>
+      <input id="searchIndex" placeholder="products">
+      <label>Query</label>
+      <input id="searchQuery" placeholder="laptop">
+      <label>Filter</label>
+      <input id="searchFilter" placeholder="year:2026,category:electronics">
+      <p><button onclick="search()">Search</button></p>
+    </section>
+    <section id="tab-save" class="tab-panel">
+      <h2>Save Index</h2>
+      <label>Index name</label>
+      <input id="saveIndex" placeholder="products">
+      <p><button onclick="saveIndex()">Save</button></p>
+    </section>
+    <section id="tab-load" class="tab-panel">
+      <h2>Load Index</h2>
+      <label>Index name</label>
+      <input id="loadIndex" placeholder="products">
+      <p><button onclick="loadIndex()">Load</button></p>
+    </section>
+    <section id="tab-compact" class="tab-panel">
+      <h2>Compact Index</h2>
+      <label>Index name</label>
+      <input id="compactIndex" placeholder="products">
+      <p><button onclick="compactIndex()">Compact</button></p>
+    </section>
+    <section>
+      <h2>Response</h2>
+      <pre id="output">{}</pre>
+    </section>
+  </main>
+  <script>
+    const out = document.getElementById('output');
+    const statusEl = document.getElementById('status');
+    function openTab(name) {
+      document.querySelectorAll('.tab-panel').forEach(el => el.classList.toggle('active', el.id === 'tab-' + name));
+      document.querySelectorAll('.tab-button').forEach(el => el.classList.toggle('active', el.dataset.tab === name));
+    }
+    function setStatus(text) { statusEl.textContent = text; }
+    function show(data) { out.textContent = JSON.stringify(data, null, 2); }
+    function csv(id) { return document.getElementById(id).value.split(',').map(v => v.trim()).filter(Boolean); }
+    async function request(path, options) {
+      setStatus('Working...');
+      try {
+        const res = await fetch(path, options);
+        const text = await res.text();
+        let data;
+        try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+        show(data);
+        setStatus(res.ok ? 'OK' : 'Error');
+        await refreshIndexes(false);
+        return data;
+      } catch (err) {
+        setStatus('Error');
+        show({ error: String(err) });
+      }
+    }
+    async function refreshIndexes(showOutput = true) {
+      if (showOutput) setStatus('Working...');
+      try {
+        const res = await fetch('/api/list-indexes');
+        const data = await res.json();
+        renderIndexes(data.indexes || []);
+        if (showOutput) {
+          show(data);
+          setStatus(res.ok ? 'OK' : 'Error');
+        }
+      } catch (err) {
+        if (showOutput) {
+          setStatus('Error');
+          show({ error: String(err) });
+        }
+      }
+    }
+    function renderIndexes(indexes) {
+      if (!indexes.length) {
+        document.getElementById('indexes').innerHTML = '<p class="status">No indexes.</p>';
+        return;
+      }
+      document.getElementById('indexes').innerHTML = '<table><thead><tr><th>Name</th><th>Active Docs</th><th>Stored Docs</th><th>Deleted Versions</th><th>Fields</th><th>Filters</th><th>Result Count</th></tr></thead><tbody>' +
+        indexes.map(i => '<tr><td>' + esc(i.name) + '</td><td>' + i.activeDocs + '</td><td>' + i.storedDocs + '</td><td>' + i.deletedVersions + '</td><td>' + esc((i.indexFields || []).join(', ')) + '</td><td>' + esc((i.filters || []).join(', ')) + '</td><td>' + i.resultCount + '</td></tr>').join('') +
+        '</tbody></table>';
+    }
+    function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    async function createIndex() {
+      let weights = {};
+      const raw = document.getElementById('createWeights').value.trim();
+      if (raw) weights = JSON.parse(raw);
+      await request('/api/create-index', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          indexName: document.getElementById('createName').value.trim(),
+          indexFields: csv('createFields'),
+          fieldWeights: weights,
+          filters: csv('createFilters'),
+          resultCount: Number(document.getElementById('createResultCount').value || 100)
+        })
+      });
+    }
+    async function addDocument() {
+      const indexName = document.getElementById('docIndex').value.trim();
+      const documentBody = JSON.parse(document.getElementById('docBody').value);
+      await request('/api/document?indexName=' + encodeURIComponent(indexName), {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ document: documentBody })
+      });
+    }
+    async function deleteDocument() {
+      const indexName = document.getElementById('deleteIndex').value.trim();
+      const id = document.getElementById('deleteID').value.trim();
+      const params = new URLSearchParams();
+      params.set('indexName', indexName);
+      params.set('id', id);
+      await request('/api/document?' + params.toString(), { method: 'DELETE' });
+    }
+    async function search() {
+      const params = new URLSearchParams();
+      params.set('index', document.getElementById('searchIndex').value.trim());
+      params.set('q', document.getElementById('searchQuery').value);
+      const filter = document.getElementById('searchFilter').value.trim();
+      if (filter) params.set('filter', filter);
+      await request('/api/search?' + params.toString(), { method: 'GET' });
+    }
+    async function saveIndex() {
+      await request('/api/save-controller', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ indexName: document.getElementById('saveIndex').value.trim() })
+      });
+    }
+    async function loadIndex() {
+      await request('/api/load-controller', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ indexName: document.getElementById('loadIndex').value.trim() })
+      });
+    }
+    async function compactIndex() {
+      await request('/api/compact-index', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ indexName: document.getElementById('compactIndex').value.trim() })
+      });
+      await refreshIndexes(false);
+    }
+    refreshIndexes(false);
+  </script>
+</body>
+</html>

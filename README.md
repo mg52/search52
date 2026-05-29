@@ -1,5 +1,4 @@
 ![build](https://github.com/mg52/search52/actions/workflows/go.yml/badge.svg)
-[![codecov](https://codecov.io/gh/mg52/search52/branch/main/graph/badge.svg)](https://codecov.io/gh/mg52/search52)
 
 # In-Memory Search Engine
 
@@ -24,7 +23,7 @@ All numbers are from an Apple M1 Pro. The MusicBrainz load test uses the real `m
 
 Environment: Apple M1 Pro, darwin/arm64, Go 1.25.4, `GOMAXPROCS=10`.
 
-Dataset: `mb_5m.json`, 5 000 000 MusicBrainz documents, 585 MB JSON. Index fields: `title`, `artist`, `album`. Filter field: `year`. Result size: 100. Hard-coded prefix map cap: 5 000. Multi-term last-token prefix expansion is adaptive: 100 completions for 1-2 chars, 60 for 3-5 chars, and 50 after that. Query vocabulary: 100 000 tokens extracted from the same indexed text fields. Query generation used the same rules as `benchmark.go`: single-term queries are 65% exact, 25% prefix, 10% misspelled; multi-term queries use 2-4 tokens, 10% have one misspelled token, and the last token is prefix-truncated 25% of the time. `-mode-mix balanced` sends equal traffic to Single/NoFilter, Single/Filter, Multi/NoFilter, and Multi/Filter.
+Dataset: `mb_5m.json`, 5 000 000 MusicBrainz documents, 585 MB JSON. Index fields: `title`, `artist`, `album`. Filter field: `year`. Result size: 100. Hard-coded prefix map cap: 5 000. Multi-term last-token prefix expansion is adaptive: 100 completions for 1-2 chars, 60 for 3-5 chars, and 50 after that. Query vocabulary: all unique tokens extracted from the same indexed text fields. Query generation used the same rules as `benchmark.go`: single-term queries are 65% exact, 25% prefix, 10% misspelled; multi-term queries use 2-4 tokens, 10% have one misspelled token, and the last token is prefix-truncated 25% of the time. `-mode-mix balanced` sends equal traffic to Single/NoFilter, Single/Filter, Multi/NoFilter, and Multi/Filter.
 
 Setup:
 
@@ -32,7 +31,6 @@ Setup:
 go run ./cmd/bench vocab \
   -data mb_5m.json \
   -fields title,artist,album \
-  -size 100000 \
   -out mb_vocab.txt
 
 go run ./cmd/service
@@ -65,7 +63,7 @@ Index/load summary:
 |---|---:|
 | Documents indexed | 5 000 000 |
 | JSON file size | 585 MB |
-| Vocabulary size | 100 000 |
+| Vocabulary size | All unique tokens from `title`, `artist`, `album` |
 | InsertDocs time | 5.73 s |
 | BuildDocumentIndex time | 87.89 s |
 | Engine-reported total index time | 93.63 s |
@@ -121,7 +119,7 @@ Filter queries are faster than no-filter equivalents because the bitset pre-prun
 go run ./cmd/service
 ```
 
-The HTTP service listens on `:8080`.
+The API service listens on `:8080`. A small admin UI listens on `:8081`.
 
 ### Docker
 
@@ -130,8 +128,9 @@ docker build -t searchengine:latest .
 
 docker run -d \
   -p 8080:8080 \
+  -p 8081:8081 \
   -v search_data:/data \
-  -e INDEX_DATA_DIR=/data \
+  -e SEARCH52_INDEX_DATA_DIR=/data \
   --name searchengine \
   searchengine:latest
 ```
@@ -147,7 +146,7 @@ DataMap map[string]map[uint32]int
 // term → internalDocID → score
 ```
 
-Every document is tokenized from the configured `IndexFields`. Tokenization lowercases the text, strips every non-alphanumeric character (via a compiled regexp), and drops a fixed stop-word list (`a`, `the`, `and`). Index fields can optionally define `fieldWeights`; missing or non-positive weights default to `1`. Each token receives a normalized score based on its field weight, so a token from a field with weight `3` is worth three times a token from a field with weight `1` while keeping the document's total score budget roughly stable. If the same token appears multiple times its scores are summed, so denser matches rank higher. `DataMap` is the primary posting-list and ranking structure used by the search hot path.
+Every document is tokenized from the configured `IndexFields`. Tokenization lowercases the text, strips every non-alphanumeric character (via a compiled regexp), and drops a fixed stop-word list (`a`, `the`, `and`). Index fields can optionally define `fieldWeights`; missing weights default to `1`, while the HTTP API rejects non-positive weights. Each token receives a normalized score based on its field weight, so a token from a field with weight `3` is worth three times a token from a field with weight `1` while keeping the document's total score budget roughly stable. If the same token appears multiple times its scores are summed, so denser matches rank higher. `DataMap` is the primary posting-list and ranking structure used by the search hot path.
 
 ### 2. Internal IDs and Tombstones
 
@@ -160,7 +159,7 @@ Documents are identified internally by a monotonically increasing `uint32`:
 | `Documents` | internal ID → raw field map |
 | `DocDeleted` | internal ID → tombstoned? |
 
-**Update semantics**: updating a document assigns a new internal ID and sets `DocDeleted[oldID] = true`. The old posting-list entries are never removed; searches skip tombstoned IDs at scan time. This makes old-version cleanup O(1) at the cost of some wasted posting-list entries, while the new version is tokenized and indexed normally.
+**Update semantics**: updating a document assigns a new internal ID and sets `DocDeleted[oldID] = true`. Searches skip tombstoned IDs at scan time, while the new version is tokenized and indexed normally. To reclaim old posting-list entries, call the compact endpoint; it rebuilds the inverted index, filter bitsets, prefix map, and fuzzy dictionary from active documents only.
 
 ### 3. Prefix and Fuzzy Matching
 
@@ -234,13 +233,23 @@ Score for a matching document is the sum of its scores across all matched groups
 
 ### 8. Persistence
 
-`SaveAll` serialises only the raw document store and metadata (IDs, field config) to a single gob file. `LoadAll` restores the documents and then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `SymSpell` — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change.
+`SaveAll` serialises only the raw document store and metadata (IDs, field config) to a single gob file. `LoadAll` restores the documents and then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `SymSpell` — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change. If `engine.gob` is corrupt or fails validation during the HTTP load endpoint, the existing in-memory index is left unchanged and the endpoint returns a clear error.
 
 ---
 
 ## HTTP API
 
-All endpoints return JSON and use HTTP status codes (`201 Created`, `200 OK`, `400 Bad Request`, `404 Not Found`, `405 Method Not Allowed`, `409 Conflict`, `500 Internal Server Error`).
+All endpoints return JSON and use HTTP status codes (`201 Created`, `200 OK`, `400 Bad Request`, `404 Not Found`, `405 Method Not Allowed`, `409 Conflict`, `504 Gateway Timeout`, `500 Internal Server Error`). Error responses have a fixed schema:
+
+```json
+{
+  "status": "error",
+  "statusCode": 400,
+  "error": "message"
+}
+```
+
+Input validation is intentionally strict: index/filter/field names may contain only letters, numbers, `_`, `-`, and `.`; unknown JSON fields are rejected; `resultCount` must be between 1 and 10 000; search queries are capped at 512 characters; filter strings are capped at 2 048 characters; individual filter values are capped at 256 characters; JSON request bodies are capped at 1 MiB except single-document writes, which allow 5 MiB; bulk uploads allow up to 1 GiB.
 
 ### 1. Create Index
 
@@ -256,7 +265,34 @@ curl -X POST http://localhost:8080/create-index \
   }'
 ```
 
-### 2. Bulk Add to Index
+### 2. List Indexes
+
+```bash
+curl http://localhost:8080/list-indexes
+```
+
+The response includes every in-memory index and its current active document count. `storedDocs` includes old tombstoned document versions retained for update/delete performance, while `activeDocs` is the current live record count.
+
+```json
+{
+  "status": "success",
+  "statusCode": 200,
+  "total": 1,
+  "indexes": [
+    {
+      "name": "products",
+      "activeDocs": 2,
+      "storedDocs": 3,
+      "deletedVersions": 1,
+      "indexFields": ["name", "tags"],
+      "filters": ["year"],
+      "resultCount": 10
+    }
+  ]
+}
+```
+
+### 3. Bulk Add to Index
 
 ```bash
 curl -X POST 'http://localhost:8080/add-to-index?indexName=products' \
@@ -282,7 +318,7 @@ id,name,tags,year
 2,bar,c,2021
 ```
 
-### 3. Search
+### 4. Search
 
 ```bash
 # Simple query
@@ -301,7 +337,9 @@ curl 'http://localhost:8080/search?index=products&q=laptop&filter=year:2020,year
 | `q` | Search query (single or multi-term) |
 | `filter` | Comma-separated `field:value` pairs |
 
-### 4. Add or Update Single Document
+Search requests use a 10 second context timeout. If a query exceeds that budget, the endpoint returns `504 Gateway Timeout`.
+
+### 5. Add or Update Single Document
 
 ```bash
 curl -X POST 'http://localhost:8080/document?indexName=products' \
@@ -313,13 +351,13 @@ curl -X POST 'http://localhost:8080/document?indexName=products' \
 
 `indexName` can also be sent in the JSON body instead of the query string.
 
-### 5. Delete Single Document
+### 6. Delete Single Document
 
 ```bash
 curl -X DELETE 'http://localhost:8080/document?indexName=products&id=14'
 ```
 
-### 6. Save Index
+### 7. Save Index
 
 ```bash
 curl -X POST http://localhost:8080/save-controller \
@@ -327,9 +365,9 @@ curl -X POST http://localhost:8080/save-controller \
   -d '{ "indexName": "products" }'
 ```
 
-Indexes are saved under `$INDEX_DATA_DIR/<indexName>/engine.gob`; if `INDEX_DATA_DIR` is not set, the service uses `./data`.
+Indexes are saved under `$SEARCH52_INDEX_DATA_DIR/<indexName>/engine.gob`; if `SEARCH52_INDEX_DATA_DIR` is not set, the service uses `./data`.
 
-### 7. Load Index
+### 8. Load Index
 
 ```bash
 curl -X POST http://localhost:8080/load-controller \
@@ -337,15 +375,49 @@ curl -X POST http://localhost:8080/load-controller \
   -d '{ "indexName": "products" }'
 ```
 
-### 8. Health Check
+Load is rollback-safe: a corrupt or invalid `engine.gob` does not replace an already-loaded in-memory index.
+
+### 9. Compact Index
+
+```bash
+curl -X POST http://localhost:8080/compact-index \
+  -H 'Content-Type: application/json' \
+  -d '{ "indexName": "products" }'
+```
+
+Compaction removes tombstoned old document versions from all postings, filters, prefix arrays, fuzzy data, and document maps. The response includes before/after active and stored document counts.
+
+### 10. Health Check
 
 ```bash
 curl http://localhost:8080/health
 ```
 
 ```json
-{ "status": "ok", "duration": "5µs", "durationMs": 0 }
+{ "status": "ok", "statusCode": 200, "duration": "5µs", "durationMs": 0 }
 ```
+
+---
+
+## Admin UI
+
+Start the service and open:
+
+```text
+http://localhost:8081
+```
+
+The admin UI runs on a separate port and shares the same in-memory engine instance as the API server. It can:
+
+- list indexes and active document counts
+- create an index
+- add or update a single JSON document
+- delete a single document by ID
+- run search queries with optional filters
+- save and load indexes from disk
+- compact an index to remove tombstoned versions
+
+The UI port can be changed with `SEARCH52_ADMIN_ADDR`; the API port can be changed with `SEARCH52_API_ADDR`.
 
 ---
 
@@ -388,16 +460,15 @@ go run ./cmd/bench vocab -size 100000 -out vocab.txt
 go run ./cmd/bench vocab \
   -data mb_5m.json \
   -fields title,artist,album \
-  -size 100000 \
   -out mb_vocab.txt
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `-size` | `100000` | Number of unique words |
+| `-size` | `100000` | Number of unique mock words to generate when `-data` is not set |
 | `-out` | `vocab.txt` | Output file |
 | `-seed` | `42` | RNG seed |
-| `-data` | `""` | Optional JSON document file to extract vocabulary from |
+| `-data` | `""` | Optional JSON document file to extract vocabulary from. When set, all unique tokens from `-fields` are written. |
 | `-fields` | `title,tags` | Comma-separated fields to extract when `-data` is set |
 
 ### Step 2 — generate documents
@@ -482,6 +553,15 @@ go run ./cmd/bench loadtest \
 | `-timeout` | `10s` | Per-request HTTP timeout |
 | `-seed` | random | RNG seed for reproducibility |
 | `-keepalive` | `true` | Use HTTP keep-alive |
+
+The load-test command pre-generates query pools sized to the request count, with a minimum of 1 000. For `-requests 100000`, it builds 100 000 single-term queries, 100 000 multi-term queries, and 100 000 year filters, then selects by request index. In `balanced` mode this keeps the four traffic modes evenly split without cycling through only a tiny 1 000-query pool.
+
+When the run finishes it prints Markdown tables:
+
+- `Load test totals`: requested total requests, processed total requests, total duration, and requests per second.
+- `Load test summary`: overall and per-mode latency, status, error, RPS, p50/p95/p99.
+- `Load test configuration`: target URL, index, vocab size, query pool size, workers, seed, timeout, and runtime settings.
+- `Query generation details`: actual generated counts for single exact/prefix/misspelled queries and multi-term misspelled/prefix/term-count distribution.
 
 ## License
 

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -10,12 +11,41 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mg52/search52/internal/engine"
 )
+
+const (
+	searchTimeout        = 10 * time.Second
+	maxJSONBodyBytes     = 1 << 20
+	maxDocumentBodyBytes = 5 << 20
+	maxUploadBytes       = 1 << 30
+	maxIndexNameLength   = 128
+	maxFieldNameLength   = 64
+	maxIndexFields       = 32
+	maxFilters           = 32
+	maxFilterValues      = 64
+	maxFilterValueLength = 256
+	maxFilterStringLen   = 2048
+	maxQueryLength       = 512
+	maxResultCount       = 10_000
+	maxFieldWeight       = 1_000
+	maxDocumentFields    = 256
+	maxDocumentIDLength  = 256
+)
+
+var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+type ErrorResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
+	Error      string `json:"error"`
+}
 
 // AddToIndexRequest is the payload for adding documents to an existing index.
 type AddToIndexRequest struct {
@@ -24,6 +54,8 @@ type AddToIndexRequest struct {
 
 // AddToIndexResponse is returned on successful addition.
 type AddToIndexResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
 	IndexName  string `json:"indexName"`
 	AddedCount int    `json:"addedCount"`
 	Duration   string `json:"duration"`
@@ -42,10 +74,22 @@ type CreateIndexRequest struct {
 
 // CreateIndexResponse is returned on succressful index creation.
 type CreateIndexResponse struct {
+	Status       string         `json:"status"`
+	StatusCode   int            `json:"statusCode"`
 	IndexName    string         `json:"indexName"`
 	ResultCount  int            `json:"resultCount"`
 	FieldWeights map[string]int `json:"fieldWeights"`
 	Duration     string         `json:"duration"`
+}
+
+type SearchResponse struct {
+	Status     string               `json:"status"`
+	StatusCode int                  `json:"statusCode"`
+	Index      string               `json:"index"`
+	Query      string               `json:"query"`
+	Response   *engine.SearchResult `json:"response"`
+	Duration   string               `json:"duration"`
+	DurationMs int64                `json:"durationInMs"`
 }
 
 // AddOrUpdateDocumentRequest is the payload for inserting/updating a single document.
@@ -76,6 +120,58 @@ type DeleteDocumentResponse struct {
 	DurationMs int64  `json:"durationMs"`
 }
 
+type IndexInfo struct {
+	Name            string         `json:"name"`
+	ActiveDocs      int            `json:"activeDocs"`
+	StoredDocs      int            `json:"storedDocs"`
+	IndexFields     []string       `json:"indexFields"`
+	FieldWeights    map[string]int `json:"fieldWeights"`
+	Filters         []string       `json:"filters"`
+	ResultCount     int            `json:"resultCount"`
+	DeletedVersions int            `json:"deletedVersions"`
+}
+
+type ListIndexesResponse struct {
+	Status     string      `json:"status"`
+	StatusCode int         `json:"statusCode"`
+	Total      int         `json:"total"`
+	Indexes    []IndexInfo `json:"indexes"`
+}
+
+type SaveEngineResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
+	IndexName  string `json:"indexName"`
+}
+
+type LoadEngineResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
+	IndexName  string `json:"indexName"`
+	Duration   string `json:"duration"`
+	DurationMs int64  `json:"durationMs"`
+}
+
+type CompactIndexRequest struct {
+	IndexName string `json:"indexName"`
+}
+
+type CompactIndexResponse struct {
+	Status     string              `json:"status"`
+	StatusCode int                 `json:"statusCode"`
+	IndexName  string              `json:"indexName"`
+	Stats      engine.CompactStats `json:"stats"`
+	Duration   string              `json:"duration"`
+	DurationMs int64               `json:"durationMs"`
+}
+
+type HealthResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
+	Duration   string `json:"duration"`
+	DurationMs int64  `json:"durationMs"`
+}
+
 type HTTP struct {
 	mu      sync.RWMutex
 	engines map[string]*engine.SearchEngine
@@ -89,15 +185,200 @@ func NewHTTP() *HTTP {
 }
 
 func errJSON(w http.ResponseWriter, statusCode int, err error) {
-	body, jsonErr := json.Marshal(map[string]interface{}{
-		"err": fmt.Sprintf("%v", err),
+	body, jsonErr := json.Marshal(ErrorResponse{
+		Status:     "error",
+		StatusCode: statusCode,
+		Error:      fmt.Sprintf("%v", err),
 	})
 	if jsonErr != nil {
-		body = []byte(fmt.Sprintf(`{"err":%q}`, err.Error()))
+		body = []byte(fmt.Sprintf(`{"status":"error","statusCode":%d,"error":%q}`, statusCode, err.Error()))
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	w.Write(body)
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, dst interface{}) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON payload: %w", err)
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("invalid JSON payload: multiple JSON values")
+	}
+	return nil
+}
+
+func validateIdentifier(kind, value string, maxLen int) error {
+	if value == "" {
+		return fmt.Errorf("`%s` is required", kind)
+	}
+	if len(value) > maxLen {
+		return fmt.Errorf("`%s` must be at most %d characters", kind, maxLen)
+	}
+	if !identifierPattern.MatchString(value) {
+		return fmt.Errorf("`%s` may only contain letters, numbers, underscore, dash and dot", kind)
+	}
+	return nil
+}
+
+func validateFieldList(name string, fields []string, required bool, maxCount int) error {
+	if required && len(fields) == 0 {
+		return fmt.Errorf("`%s` must contain at least one field", name)
+	}
+	if len(fields) > maxCount {
+		return fmt.Errorf("`%s` can contain at most %d fields", name, maxCount)
+	}
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		if err := validateIdentifier(name, field, maxFieldNameLength); err != nil {
+			return err
+		}
+		if _, ok := seen[field]; ok {
+			return fmt.Errorf("`%s` contains duplicate field %q", name, field)
+		}
+		seen[field] = struct{}{}
+	}
+	return nil
+}
+
+func validateCreateIndexRequest(req *CreateIndexRequest) error {
+	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
+		return err
+	}
+	if err := validateFieldList("indexFields", req.IndexFields, true, maxIndexFields); err != nil {
+		return err
+	}
+	if err := validateFieldList("filters", req.Filters, false, maxFilters); err != nil {
+		return err
+	}
+	if req.ResultCount == 0 {
+		req.ResultCount = 100
+	}
+	if req.ResultCount < 1 || req.ResultCount > maxResultCount {
+		return fmt.Errorf("`resultCount` must be between 1 and %d", maxResultCount)
+	}
+	indexFields := make(map[string]struct{}, len(req.IndexFields))
+	for _, field := range req.IndexFields {
+		indexFields[field] = struct{}{}
+	}
+	for field, weight := range req.FieldWeights {
+		if err := validateIdentifier("fieldWeights", field, maxFieldNameLength); err != nil {
+			return err
+		}
+		if _, ok := indexFields[field]; !ok {
+			return fmt.Errorf("`fieldWeights.%s` must refer to an index field", field)
+		}
+		if weight < 1 || weight > maxFieldWeight {
+			return fmt.Errorf("`fieldWeights.%s` must be between 1 and %d", field, maxFieldWeight)
+		}
+	}
+	return nil
+}
+
+func parseAndValidateSearchFilters(raw string, allowed map[string]bool) (map[string][]interface{}, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	if len(raw) > maxFilterStringLen {
+		return nil, fmt.Errorf("`filter` must be at most %d characters", maxFilterStringLen)
+	}
+	filters := make(map[string][]interface{})
+	items := strings.Split(raw, ",")
+	if len(items) > maxFilterValues {
+		return nil, fmt.Errorf("`filter` can contain at most %d values", maxFilterValues)
+	}
+	for _, item := range items {
+		parts := strings.SplitN(strings.TrimSpace(item), ":", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid filter %q, expected field:value", item)
+		}
+		field := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if len(value) > maxFilterValueLength {
+			return nil, fmt.Errorf("filter value for %q must be at most %d characters", field, maxFilterValueLength)
+		}
+		if err := validateIdentifier("filter", field, maxFieldNameLength); err != nil {
+			return nil, err
+		}
+		if !allowed[field] {
+			return nil, fmt.Errorf("filter field %q is not configured for this index", field)
+		}
+		if len(filters[field]) >= maxFilterValues {
+			return nil, fmt.Errorf("filter field %q has too many values", field)
+		}
+		filters[field] = append(filters[field], value)
+	}
+	return filters, nil
+}
+
+func validateDocument(doc map[string]interface{}) error {
+	if len(doc) > maxDocumentFields {
+		return fmt.Errorf("document can contain at most %d fields", maxDocumentFields)
+	}
+	rawID, ok := doc["id"]
+	if !ok || rawID == nil {
+		return errors.New("document missing `id` field")
+	}
+	id := fmt.Sprintf("%v", rawID)
+	if id == "" || id == "<nil>" {
+		return errors.New("invalid document `id`")
+	}
+	if len(id) > maxDocumentIDLength {
+		return fmt.Errorf("document `id` must be at most %d characters", maxDocumentIDLength)
+	}
+	return nil
+}
+
+func (ht *HTTP) ListIndexes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		errJSON(w, http.StatusMethodNotAllowed, errors.New("unsupported method"))
+		return
+	}
+
+	ht.mu.RLock()
+	names := make([]string, 0, len(ht.engines))
+	engines := make(map[string]*engine.SearchEngine, len(ht.engines))
+	for name, sec := range ht.engines {
+		names = append(names, name)
+		engines[name] = sec
+	}
+	ht.mu.RUnlock()
+	sort.Strings(names)
+
+	indexes := make([]IndexInfo, 0, len(names))
+	for _, name := range names {
+		stats := engines[name].Stats()
+		filters := make([]string, 0, len(stats.Filters))
+		for filter := range stats.Filters {
+			filters = append(filters, filter)
+		}
+		sort.Strings(filters)
+
+		indexes = append(indexes, IndexInfo{
+			Name:            name,
+			ActiveDocs:      stats.ActiveDocuments,
+			StoredDocs:      stats.StoredDocuments,
+			IndexFields:     stats.IndexFields,
+			FieldWeights:    stats.FieldWeights,
+			Filters:         filters,
+			ResultCount:     stats.ResultSize,
+			DeletedVersions: stats.StoredDocuments - stats.ActiveDocuments,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(ListIndexesResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
+		Total:      len(indexes),
+		Indexes:    indexes,
+	})
 }
 
 func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
@@ -107,8 +388,8 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 	}
 
 	indexName := r.URL.Query().Get("index")
-	if indexName == "" {
-		errJSON(w, http.StatusBadRequest, errors.New("`index` query parameter is required"))
+	if err := validateIdentifier("index", indexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -121,34 +402,44 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query().Get("q")
+	if len(query) > maxQueryLength {
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("`q` must be at most %d characters", maxQueryLength))
+		return
+	}
 
-	// Parse filters
-	filters := make(map[string][]interface{})
-	filterStr := r.URL.Query().Get("filter")
-	if filterStr != "" {
-		for _, item := range strings.Split(filterStr, ",") {
-			parts := strings.SplitN(item, ":", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			filters[parts[0]] = append(filters[parts[0]], parts[1])
-		}
+	filters, err := parseAndValidateSearchFilters(r.URL.Query().Get("filter"), sec.FilterFields())
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
 	}
 
 	startTime := time.Now()
 
-	result := sec.Search(query, filters)
+	ctx, cancel := context.WithTimeout(r.Context(), searchTimeout)
+	defer cancel()
+	result, err := sec.SearchContext(ctx, query, filters)
+	if err != nil {
+		if errors.Is(err, engine.ErrSearchCanceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			errJSON(w, http.StatusGatewayTimeout, fmt.Errorf("search canceled after %s", searchTimeout))
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, err)
+		return
+	}
+	if result == nil {
+		result = &engine.SearchResult{}
+	}
 
 	duration := time.Since(startTime)
 
-	resp := map[string]interface{}{
-		"status":       "success",
-		"statusCode":   200,
-		"index":        indexName,
-		"query":        query,
-		"response":     result,
-		"duration":     duration,
-		"durationInMs": duration.Milliseconds(),
+	resp := SearchResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
+		Index:      indexName,
+		Query:      query,
+		Response:   result,
+		Duration:   duration.String(),
+		DurationMs: duration.Milliseconds(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -164,25 +455,21 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CreateIndexRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON payload: %w", err))
+	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateCreateIndexRequest(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 
-	if req.IndexName == "" {
-		errJSON(w, http.StatusBadRequest, errors.New("`indexName` is required"))
-		return
-	}
 	ht.mu.RLock()
 	_, exists := ht.engines[req.IndexName]
 	ht.mu.RUnlock()
 	if exists {
 		errJSON(w, http.StatusConflict, fmt.Errorf("index %q already exists", req.IndexName))
 		return
-	}
-
-	if req.ResultCount <= 0 {
-		req.ResultCount = 100
 	}
 
 	filterMap := make(map[string]bool, len(req.Filters))
@@ -206,6 +493,8 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(CreateIndexResponse{
+		Status:       "success",
+		StatusCode:   http.StatusCreated,
 		IndexName:    req.IndexName,
 		ResultCount:  req.ResultCount,
 		FieldWeights: sec.FieldWeights,
@@ -222,8 +511,8 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	indexName := r.URL.Query().Get("indexName")
-	if indexName == "" {
-		errJSON(w, http.StatusBadRequest, errors.New("`indexName` query parameter is required"))
+	if err := validateIdentifier("indexName", indexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -235,6 +524,7 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid multipart form: %w", err))
 		return
@@ -283,11 +573,13 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(AddToIndexResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
 		IndexName:  indexName,
 		AddedCount: len(docs),
 		Duration:   elapsed.String(),
 		DurationMs: elapsed.Milliseconds(),
-		TotalDocs:  int64(len(sec.Documents)),
+		TotalDocs:  int64(sec.StoredDocumentCount()),
 	})
 }
 
@@ -309,12 +601,12 @@ func (ht *HTTP) SaveEngine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req SaveEngineRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON payload: %w", err))
+	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.IndexName == "" {
-		errJSON(w, http.StatusBadRequest, fmt.Errorf("`indexName` is required"))
+	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 	ht.mu.RLock()
@@ -325,7 +617,7 @@ func (ht *HTTP) SaveEngine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseDir := os.Getenv("INDEX_DATA_DIR")
+	baseDir := os.Getenv("SEARCH52_INDEX_DATA_DIR")
 	if baseDir == "" {
 		baseDir = "./data"
 	}
@@ -338,10 +630,10 @@ func (ht *HTTP) SaveEngine(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to save engine: %w", err))
 		return
 	}
-	resp := map[string]interface{}{
-		"status":     "success",
-		"statusCode": 200,
-		"indexName":  req.IndexName,
+	resp := SaveEngineResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
+		IndexName:  req.IndexName,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -356,16 +648,16 @@ func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req LoadEngineRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON payload: %w", err))
+	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.IndexName == "" {
-		errJSON(w, http.StatusBadRequest, fmt.Errorf("`indexName` is required"))
+	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 
-	baseDir := os.Getenv("INDEX_DATA_DIR")
+	baseDir := os.Getenv("SEARCH52_INDEX_DATA_DIR")
 	if baseDir == "" {
 		baseDir = "./data"
 	}
@@ -374,7 +666,7 @@ func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	eng, err := engine.LoadAll(dataDir)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, err)
+		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to load index %q; existing in-memory index was left unchanged: %w", req.IndexName, err))
 		return
 	}
 
@@ -384,12 +676,12 @@ func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 
 	duration := time.Since(start)
 
-	resp := map[string]interface{}{
-		"status":     "success",
-		"statusCode": 200,
-		"indexName":  req.IndexName,
-		"duration":   duration.String(),
-		"durationMs": duration.Milliseconds(),
+	resp := LoadEngineResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
+		IndexName:  req.IndexName,
+		Duration:   duration.String(),
+		DurationMs: duration.Milliseconds(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -410,19 +702,23 @@ func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
 	indexName := r.URL.Query().Get("indexName")
 
 	var req AddOrUpdateDocumentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON payload: %w", err))
+	if err := decodeJSON(w, r, maxDocumentBodyBytes, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 	if indexName == "" {
 		indexName = req.IndexName
 	}
-	if indexName == "" {
-		errJSON(w, http.StatusBadRequest, errors.New("`indexName` is required (query param or JSON body)"))
+	if err := validateIdentifier("indexName", indexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 	if req.Document == nil {
 		errJSON(w, http.StatusBadRequest, errors.New("`document` is required"))
+		return
+	}
+	if err := validateDocument(req.Document); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -436,16 +732,7 @@ func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate id early for response fields
-	rawID, ok := req.Document["id"]
-	if !ok || rawID == nil {
-		errJSON(w, http.StatusBadRequest, errors.New("document missing `id` field"))
-		return
-	}
-	docID := fmt.Sprintf("%v", rawID)
-	if docID == "" || docID == "<nil>" {
-		errJSON(w, http.StatusBadRequest, errors.New("invalid document `id`"))
-		return
-	}
+	docID := fmt.Sprintf("%v", req.Document["id"])
 
 	start := time.Now()
 	if err := sec.AddOrUpdateDocument(req.Document); err != nil {
@@ -461,7 +748,7 @@ func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
 		ID:         docID,
 		Duration:   duration.String(),
 		DurationMs: duration.Milliseconds(),
-		TotalDocs:  int64(len(sec.Documents)),
+		TotalDocs:  int64(sec.StoredDocumentCount()),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -479,14 +766,18 @@ func (ht *HTTP) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	indexName := r.URL.Query().Get("indexName")
-	if indexName == "" {
-		errJSON(w, http.StatusBadRequest, errors.New("`indexName` query parameter is required"))
+	if err := validateIdentifier("indexName", indexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
 		return
 	}
 
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		errJSON(w, http.StatusBadRequest, errors.New("`id` query parameter is required"))
+		return
+	}
+	if len(id) > maxDocumentIDLength {
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("`id` must be at most %d characters", maxDocumentIDLength))
 		return
 	}
 
@@ -517,6 +808,47 @@ func (ht *HTTP) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (ht *HTTP) CompactIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+
+	var req CompactIndexRequest
+	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+
+	ht.mu.RLock()
+	sec, ok := ht.engines[req.IndexName]
+	ht.mu.RUnlock()
+	if !ok {
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
+		return
+	}
+
+	start := time.Now()
+	stats := sec.CompactDeleted()
+	duration := time.Since(start)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(CompactIndexResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
+		IndexName:  req.IndexName,
+		Stats:      stats,
+		Duration:   duration.String(),
+		DurationMs: duration.Milliseconds(),
+	})
+}
+
 // Health is a simple health-check endpoint.
 func (ht *HTTP) Health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -527,10 +859,11 @@ func (ht *HTTP) Health(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	duration := time.Since(start)
-	resp := map[string]interface{}{
-		"status":     "ok",
-		"duration":   duration.String(),
-		"durationMs": duration.Milliseconds(),
+	resp := HealthResponse{
+		Status:     "ok",
+		StatusCode: http.StatusOK,
+		Duration:   duration.String(),
+		DurationMs: duration.Milliseconds(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

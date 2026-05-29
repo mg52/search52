@@ -17,6 +17,23 @@ import (
 	"time"
 )
 
+type loadTestMode struct{ multi, filter bool }
+
+type loadTestResult struct {
+	lat    time.Duration
+	mode   loadTestMode
+	err    bool
+	status int
+}
+
+type loadTestQuery struct {
+	query      string
+	kind       string
+	misspelled bool
+	prefix     bool
+	terms      int
+}
+
 func runLoadtest(args []string) {
 	fs := flag.NewFlagSet("loadtest", flag.ExitOnError)
 	baseURL := fs.String("url", "http://localhost:8080/search", "Search endpoint URL")
@@ -48,19 +65,12 @@ func runLoadtest(args []string) {
 	}
 	client := &http.Client{Timeout: *timeout, Transport: tr}
 
-	type ltMode struct{ multi, filter bool }
-	type ltResult struct {
-		lat  time.Duration
-		mode ltMode
-		err  bool
-	}
-
 	var (
 		sent      int64
 		errCount  int64
 		reqErrors int64
 		resultsMu sync.Mutex
-		results   = make([]ltResult, 0, *requests)
+		results   = make([]loadTestResult, 0, *requests)
 		statusMu  sync.Mutex
 		statuses  = make(map[int]int)
 	)
@@ -71,11 +81,15 @@ func runLoadtest(args []string) {
 	fmt.Println("Starting...")
 
 	querySeed := rand.New(rand.NewSource(*seed))
-	singleQs := buildSingleQueries(querySeed, vocab, queryPoolSize)
-	multiQs := buildMultiQueries(querySeed, vocab, queryPoolSize)
-	yearFs := buildYearFilters(querySeed, queryPoolSize)
+	queryPool := *requests
+	if queryPool < queryPoolSize {
+		queryPool = queryPoolSize
+	}
+	singleQs := buildLoadtestSingleQueries(querySeed, vocab, queryPool)
+	multiQs := buildLoadtestMultiQueries(querySeed, vocab, queryPool)
+	yearFs := buildYearFilters(querySeed, queryPool)
 	yearFilterValue := func(i int) int {
-		values := yearFs[i%queryPoolSize]["year"]
+		values := yearFs[i%len(yearFs)]["year"]
 		if len(values) == 0 {
 			return 2000
 		}
@@ -121,9 +135,9 @@ func runLoadtest(args []string) {
 				}
 
 				if isMulti {
-					q = multiQs[idx%queryPoolSize]
+					q = multiQs[idx%len(multiQs)].query
 				} else {
-					q = singleQs[idx%queryPoolSize]
+					q = singleQs[idx%len(singleQs)].query
 				}
 				reqURL := buildSearchURL(*baseURL, *indexName, q, isFilter, yearFilterValue(idx))
 
@@ -131,7 +145,7 @@ func runLoadtest(args []string) {
 				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, reqURL, nil)
 				resp, reqErr := client.Do(req)
 
-				res := ltResult{mode: ltMode{isMulti, isFilter}, err: reqErr != nil}
+				res := loadTestResult{mode: loadTestMode{isMulti, isFilter}, err: reqErr != nil}
 				if reqErr != nil {
 					atomic.AddInt64(&reqErrors, 1)
 					atomic.AddInt64(&errCount, 1)
@@ -139,6 +153,7 @@ func runLoadtest(args []string) {
 					_, _ = io.Copy(io.Discard, resp.Body)
 					_ = resp.Body.Close()
 					res.lat = time.Since(t0)
+					res.status = resp.StatusCode
 					statusMu.Lock()
 					statuses[resp.StatusCode]++
 					statusMu.Unlock()
@@ -172,47 +187,80 @@ func runLoadtest(args []string) {
 	sort.Slice(allLats, func(i, j int) bool { return allLats[i] < allLats[j] })
 	rps := float64(len(results)) / elapsed.Seconds()
 
-	fmt.Printf("\n──────────────────────────────────────────────────────\n")
-	fmt.Printf("Requests: %-6d  Workers: %-3d  Errors: %-4d  GOMAXPROCS: %d\n",
-		len(results), *workers, atomic.LoadInt64(&errCount), runtime.GOMAXPROCS(0))
-	fmt.Printf("Client errors: %-4d  HTTP statuses: %s\n", atomic.LoadInt64(&reqErrors), formatStatusCounts(statuses))
-	fmt.Printf("Wall time: %-12s  RPS: %.1f\n", elapsed.Round(time.Millisecond), rps)
-	fmt.Printf("──────────────────────────────────────────────────────\n")
-	fmt.Println("Overall latency:")
-	printLTRow("  all", allLats)
-
-	byMode := make(map[ltMode][]time.Duration)
+	byMode := make(map[loadTestMode][]time.Duration)
+	resultsByMode := make(map[loadTestMode][]loadTestResult)
 	for _, r := range results {
 		byMode[r.mode] = append(byMode[r.mode], r.lat)
+		resultsByMode[r.mode] = append(resultsByMode[r.mode], r)
 	}
-	orderedModes := []ltMode{{false, false}, {false, true}, {true, false}, {true, true}}
+	orderedModes := []loadTestMode{{false, false}, {false, true}, {true, false}, {true, true}}
 
-	fmt.Printf("\nPer-mode breakdown:\n")
-	fmt.Printf("  %-24s  %8s  %8s  %8s  %8s  %6s\n", "mode", "avg", "p50", "p95", "p99", "count")
-	fmt.Printf("  %-24s  %8s  %8s  %8s  %8s  %6s\n", "----", "---", "---", "---", "---", "-----")
+	fmt.Printf("\nLoad test totals\n\n")
+	fmt.Printf("| Metric | Value |\n")
+	fmt.Printf("|---|---:|\n")
+	fmt.Printf("| Requested total requests | %d |\n", *requests)
+	fmt.Printf("| Processed total requests | %d |\n", len(results))
+	fmt.Printf("| Load test duration | %s |\n", elapsed.Round(time.Millisecond))
+	fmt.Printf("| Requests per second | %.1f |\n", rps)
+
+	fmt.Printf("\nLoad test summary\n\n")
+	fmt.Printf("| Scope | Workers | Queries | Errors | Client errors | HTTP statuses | Wall time | RPS | avg | p50 | p95 | p99 |\n")
+	fmt.Printf("|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|\n")
+	fmt.Printf("| Overall | %d | %d | %d | %d | %s | %s | %.1f | %s | %s | %s | %s |\n",
+		*workers,
+		len(results),
+		atomic.LoadInt64(&errCount),
+		atomic.LoadInt64(&reqErrors),
+		formatStatusCounts(statuses),
+		elapsed.Round(time.Millisecond),
+		rps,
+		fmtDurMs(avgDur(allLats)),
+		fmtDurMs(pctDur(allLats, 50)),
+		fmtDurMs(pctDur(allLats, 95)),
+		fmtDurMs(pctDur(allLats, 99)),
+	)
 	for _, m := range orderedModes {
 		lats := byMode[m]
 		if len(lats) == 0 {
 			continue
 		}
 		sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
-		q, f := "Single", "NoFilter"
-		if m.multi {
-			q = "Multi "
-		}
-		if m.filter {
-			f = "Filter  "
-		}
-		fmt.Printf("  %-24s  %8s  %8s  %8s  %8s  %6d\n",
-			q+" / "+f,
+		modeResults := resultsByMode[m]
+		fmt.Printf("| %s | %d | %d | %d | %d | %s | %s | %.1f | %s | %s | %s | %s |\n",
+			modeLabel(m),
+			*workers,
+			len(lats),
+			countErrors(modeResults),
+			countClientErrors(modeResults),
+			formatStatusCounts(statusCountsFromResults(modeResults)),
+			elapsed.Round(time.Millisecond),
+			float64(len(lats))/elapsed.Seconds(),
 			fmtDurMs(avgDur(lats)),
 			fmtDurMs(pctDur(lats, 50)),
 			fmtDurMs(pctDur(lats, 95)),
 			fmtDurMs(pctDur(lats, 99)),
-			len(lats),
 		)
 	}
-	fmt.Printf("──────────────────────────────────────────────────────\n")
+
+	fmt.Printf("\nLoad test configuration\n\n")
+	fmt.Printf("| Setting | Value |\n")
+	fmt.Printf("|---|---:|\n")
+	fmt.Printf("| Target URL | %s |\n", *baseURL)
+	fmt.Printf("| Index | %s |\n", *indexName)
+	fmt.Printf("| Vocabulary file | %s |\n", *vocabFile)
+	fmt.Printf("| Vocabulary size | %d |\n", len(vocab))
+	fmt.Printf("| Query pool size | %d |\n", queryPool)
+	fmt.Printf("| Requested total queries | %d |\n", *requests)
+	fmt.Printf("| Workers | %d |\n", *workers)
+	fmt.Printf("| Seed | %d |\n", *seed)
+	fmt.Printf("| Mode mix | %s |\n", *modeMix)
+	fmt.Printf("| Filter pct | %d%% |\n", *filterPct)
+	fmt.Printf("| Multi pct | %d%% |\n", *multiPct)
+	fmt.Printf("| Timeout | %s |\n", *timeout)
+	fmt.Printf("| Keep-alive | %t |\n", *keepAlive)
+	fmt.Printf("| GOMAXPROCS | %d |\n", runtime.GOMAXPROCS(0))
+
+	printQueryStrategyTable(singleQs, multiQs)
 }
 
 func formatStatusCounts(statuses map[int]int) string {
@@ -231,7 +279,141 @@ func formatStatusCounts(statuses map[int]int) string {
 	return "{" + strings.Join(parts, ", ") + "}"
 }
 
+func modeLabel(m loadTestMode) string {
+	query := "Single"
+	filter := "NoFilter"
+	if m.multi {
+		query = "Multi"
+	}
+	if m.filter {
+		filter = "Filter"
+	}
+	return query + " / " + filter
+}
+
+func countErrors(results []loadTestResult) int {
+	n := 0
+	for _, result := range results {
+		if result.err {
+			n++
+		}
+	}
+	return n
+}
+
+func countClientErrors(results []loadTestResult) int {
+	n := 0
+	for _, result := range results {
+		if result.err && result.status == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+func statusCountsFromResults(results []loadTestResult) map[int]int {
+	statuses := make(map[int]int)
+	for _, result := range results {
+		if result.status != 0 {
+			statuses[result.status]++
+		}
+	}
+	return statuses
+}
+
+func printQueryStrategyTable(singleQs, multiQs []loadTestQuery) {
+	singleExact, singlePrefix, singleMisspelled := 0, 0, 0
+	for _, q := range singleQs {
+		switch q.kind {
+		case "exact":
+			singleExact++
+		case "prefix":
+			singlePrefix++
+		case "misspelled":
+			singleMisspelled++
+		}
+	}
+
+	multiMisspelled, multiPrefix := 0, 0
+	termCounts := make(map[int]int)
+	for _, q := range multiQs {
+		if q.misspelled {
+			multiMisspelled++
+		}
+		if q.prefix {
+			multiPrefix++
+		}
+		termCounts[q.terms]++
+	}
+
+	fmt.Printf("\nQuery generation details\n\n")
+	fmt.Printf("| Query set | Pool size | Exact | Prefix | Misspelled | 2 terms | 3 terms | 4 terms | Strategy |\n")
+	fmt.Printf("|---|---:|---:|---:|---:|---:|---:|---:|---|\n")
+	fmt.Printf("| Single-term | %d | %d | %d | %d | - | - | - | 65%% exact, 25%% prefix, 10%% misspelled |\n",
+		len(singleQs),
+		singleExact,
+		singlePrefix,
+		singleMisspelled,
+	)
+	fmt.Printf("| Multi-term | %d | - | %d | %d | %d | %d | %d | 2-4 terms; 10%% one misspelled token; last token prefix-truncated 25%% when not misspelled |\n",
+		len(multiQs),
+		multiPrefix,
+		multiMisspelled,
+		termCounts[2],
+		termCounts[3],
+		termCounts[4],
+	)
+	fmt.Printf("| Balanced mode | - | - | - | - | - | - | - | Cycles evenly through Single/NoFilter, Single/Filter, Multi/NoFilter, Multi/Filter |\n")
+}
+
 // ---- query helpers ----
+
+func buildLoadtestSingleQueries(r *rand.Rand, vocab []string, count int) []loadTestQuery {
+	qs := make([]loadTestQuery, count)
+	for i := range qs {
+		word := vocab[r.Intn(len(vocab))]
+		roll := r.Float64()
+		kind := "exact"
+		switch {
+		case roll < 0.10:
+			word = misspellWord(r, word)
+			kind = "misspelled"
+		case roll < 0.35:
+			word = prefixWord(r, word)
+			kind = "prefix"
+		}
+		qs[i] = loadTestQuery{query: word, kind: kind, misspelled: kind == "misspelled", prefix: kind == "prefix", terms: 1}
+	}
+	return qs
+}
+
+func buildLoadtestMultiQueries(r *rand.Rand, vocab []string, count int) []loadTestQuery {
+	qs := make([]loadTestQuery, count)
+	for i := range qs {
+		nTerms := 2 + r.Intn(3)
+		terms := make([]string, nTerms)
+		misspellIdx := -1
+		misspelled := false
+		prefix := false
+		if r.Float64() < 0.10 {
+			misspellIdx = r.Intn(nTerms)
+		}
+		for j := 0; j < nTerms; j++ {
+			w := vocab[r.Intn(len(vocab))]
+			switch {
+			case j == misspellIdx:
+				w = misspellWord(r, w)
+				misspelled = true
+			case j == nTerms-1 && r.Float64() < 0.25:
+				w = prefixWord(r, w)
+				prefix = true
+			}
+			terms[j] = w
+		}
+		qs[i] = loadTestQuery{query: joinTerms(terms), misspelled: misspelled, prefix: prefix, terms: nTerms}
+	}
+	return qs
+}
 
 func ltSingleQuery(r *rand.Rand, vocab []string) string {
 	word := vocab[r.Intn(len(vocab))]

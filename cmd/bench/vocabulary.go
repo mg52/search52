@@ -14,7 +14,7 @@ import (
 
 func runVocab(args []string) {
 	fs := flag.NewFlagSet("vocab", flag.ExitOnError)
-	size := fs.Int("size", 100_000, "Number of unique words to generate")
+	size := fs.Int("size", 100_000, "Number of unique mock words to generate when -data is not set")
 	out := fs.String("out", "vocab.txt", "Output file path")
 	seed := fs.Int64("seed", 42, "Random seed")
 	data := fs.String("data", "", "Optional JSON document file to extract vocabulary from")
@@ -26,7 +26,7 @@ func runVocab(args []string) {
 		err   error
 	)
 	if *data != "" {
-		words, err = extractVocabFromJSON(*data, splitCSV(*fields), *size)
+		words, err = extractVocabFromJSON(*data, splitCSV(*fields))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "extract vocab: %v\n", err)
 			os.Exit(1)
@@ -53,10 +53,7 @@ func splitCSV(s string) []string {
 	return out
 }
 
-func extractVocabFromJSON(path string, fields []string, limit int) ([]string, error) {
-	if limit <= 0 {
-		return nil, fmt.Errorf("size must be positive")
-	}
+func extractVocabFromJSON(path string, fields []string) ([]string, error) {
 	if len(fields) == 0 {
 		return nil, fmt.Errorf("at least one field is required")
 	}
@@ -76,9 +73,9 @@ func extractVocabFromJSON(path string, fields []string, limit int) ([]string, er
 		return nil, fmt.Errorf("%s must be a JSON array", path)
 	}
 
-	seen := make(map[string]struct{}, limit)
-	words := make([]string, 0, limit)
-	for dec.More() && len(words) < limit {
+	seen := make(map[string]struct{})
+	var words []string
+	for dec.More() {
 		var doc map[string]interface{}
 		if err := dec.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("decode document: %w", err)
@@ -105,12 +102,6 @@ func extractVocabFromJSON(path string, fields []string, limit int) ([]string, er
 				}
 				seen[token] = struct{}{}
 				words = append(words, token)
-				if len(words) >= limit {
-					break
-				}
-			}
-			if len(words) >= limit {
-				break
 			}
 		}
 	}

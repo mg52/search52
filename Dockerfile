@@ -33,11 +33,11 @@ COPY --from=builder /searchengine /usr/local/bin/searchengine
 # Switch to non-root
 USER appuser
 
-# Expose the HTTP port
-EXPOSE 8080
+# Expose the API and admin UI ports
+EXPOSE 8080 8081
 
 # Declare a volume for persistent index data
 VOLUME ["/data"]
 
-# Run the binary with data-dir flag
+# Run the binary
 ENTRYPOINT ["/usr/local/bin/searchengine"]

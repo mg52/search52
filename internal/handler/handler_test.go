@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -34,10 +35,19 @@ func assertEngineSearchIDs(t *testing.T, docs []engine.ReturnedDocument, exp ...
 	}
 }
 
+func mustSearchOneTerm(t *testing.T, se *engine.SearchEngine, query string, filters map[string][]interface{}) []engine.ReturnedDocument {
+	t.Helper()
+	docs, err := se.SearchOneTerm(context.Background(), query, filters)
+	if err != nil {
+		t.Fatalf("SearchOneTerm(%q): %v", query, err)
+	}
+	return docs
+}
+
 func TestCreateIndexHandler(t *testing.T) {
 	h := NewHTTP()
 	// Valid create-index request
-	body := `{"indexName":"testidx","indexFields":["name"],"filters":["year"],"resultCount":5,"workers":2}`
+	body := `{"indexName":"testidx","indexFields":["name"],"filters":["year"],"resultCount":5}`
 	req := httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
@@ -64,7 +74,7 @@ func TestCreateIndexHandler_FieldWeights(t *testing.T) {
 	body := `{
 		"indexName":"weightedidx",
 		"indexFields":["title","artist","album"],
-		"fieldWeights":{"title":5,"artist":2,"album":0,"ignored":9},
+		"fieldWeights":{"title":5,"artist":2,"album":1},
 		"filters":["year"],
 		"resultCount":5
 	}`
@@ -88,10 +98,7 @@ func TestCreateIndexHandler_FieldWeights(t *testing.T) {
 		t.Fatalf("expected artist weight 2; got %+v", resp.FieldWeights)
 	}
 	if resp.FieldWeights["album"] != 1 {
-		t.Fatalf("expected invalid album weight to default to 1; got %+v", resp.FieldWeights)
-	}
-	if _, ok := resp.FieldWeights["ignored"]; ok {
-		t.Fatalf("expected non-index field weight to be ignored; got %+v", resp.FieldWeights)
+		t.Fatalf("expected album weight 1; got %+v", resp.FieldWeights)
 	}
 
 	created := h.engines["weightedidx"]
@@ -100,6 +107,84 @@ func TestCreateIndexHandler_FieldWeights(t *testing.T) {
 	}
 	if created.FieldWeights["title"] != 5 || created.FieldWeights["artist"] != 2 || created.FieldWeights["album"] != 1 {
 		t.Fatalf("engine field weights mismatch: %+v", created.FieldWeights)
+	}
+}
+
+func TestListIndexesHandler(t *testing.T) {
+	h := NewHTTP()
+	h.engines["products"] = engine.NewSearchEngineWithFieldWeights(
+		[]string{"name", "tags"},
+		map[string]int{"name": 3, "tags": 1},
+		map[string]bool{"year": true, "category": true},
+		10,
+	)
+	h.engines["empty"] = engine.NewSearchEngine([]string{"title"}, nil, 5)
+
+	if err := h.engines["products"].AddOrUpdateDocument(map[string]interface{}{
+		"id": "1", "name": "Sunny Rio", "tags": "music", "year": "2020", "category": "album",
+	}); err != nil {
+		t.Fatalf("AddOrUpdateDocument doc1: %v", err)
+	}
+	if err := h.engines["products"].AddOrUpdateDocument(map[string]interface{}{
+		"id": "2", "name": "Cloudy Day", "tags": "weather", "year": "2021", "category": "book",
+	}); err != nil {
+		t.Fatalf("AddOrUpdateDocument doc2: %v", err)
+	}
+	if err := h.engines["products"].AddOrUpdateDocument(map[string]interface{}{
+		"id": "2", "name": "Updated Day", "tags": "weather", "year": "2021", "category": "book",
+	}); err != nil {
+		t.Fatalf("AddOrUpdateDocument doc2 update: %v", err)
+	}
+	if ok := h.engines["products"].DeleteDocument("1"); !ok {
+		t.Fatalf("DeleteDocument doc1 expected true")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/list-indexes", nil)
+	rr := httptest.NewRecorder()
+	h.ListIndexes(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp ListIndexesResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Total != 2 {
+		t.Fatalf("expected 2 indexes, got %+v", resp)
+	}
+	if resp.Indexes[0].Name != "empty" || resp.Indexes[1].Name != "products" {
+		t.Fatalf("expected sorted indexes, got %+v", resp.Indexes)
+	}
+	products := resp.Indexes[1]
+	if products.ActiveDocs != 1 {
+		t.Fatalf("expected products activeDocs=1, got %+v", products)
+	}
+	if products.StoredDocs != 3 {
+		t.Fatalf("expected products storedDocs=3, got %+v", products)
+	}
+	if products.DeletedVersions != 2 {
+		t.Fatalf("expected products deletedVersions=2, got %+v", products)
+	}
+	if products.ResultCount != 10 {
+		t.Fatalf("expected products resultCount=10, got %+v", products)
+	}
+	if products.FieldWeights["name"] != 3 || products.FieldWeights["tags"] != 1 {
+		t.Fatalf("expected field weights, got %+v", products.FieldWeights)
+	}
+	if len(products.Filters) != 2 || products.Filters[0] != "category" || products.Filters[1] != "year" {
+		t.Fatalf("expected sorted filters, got %+v", products.Filters)
+	}
+}
+
+func TestListIndexesHandler_MethodNotAllowed(t *testing.T) {
+	h := NewHTTP()
+	req := httptest.NewRequest(http.MethodPost, "/list-indexes", nil)
+	rr := httptest.NewRecorder()
+	h.ListIndexes(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", rr.Code)
 	}
 }
 
@@ -118,6 +203,24 @@ func TestHealthHandler(t *testing.T) {
 	}
 	if resp["status"] != "ok" {
 		t.Errorf("expected status=ok; got %v", resp["status"])
+	}
+}
+
+func TestErrorResponseSchema(t *testing.T) {
+	h := NewHTTP()
+	req := httptest.NewRequest(http.MethodGet, "/search?q=x", nil)
+	rr := httptest.NewRecorder()
+	h.Search(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400; got %d", rr.Code)
+	}
+	var resp ErrorResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if resp.Status != "error" || resp.StatusCode != http.StatusBadRequest || resp.Error == "" {
+		t.Fatalf("unexpected error response: %+v", resp)
 	}
 }
 
@@ -180,7 +283,7 @@ func TestSaveEngine_Success(t *testing.T) {
 		t.Fatalf("chdir to tmp failed: %v", err)
 	}
 
-	os.Setenv("INDEX_DATA_DIR", tmp)
+	t.Setenv("SEARCH52_INDEX_DATA_DIR", tmp)
 	ht := NewHTTP()
 	idx := "idx"
 	ht.engines[idx] = engine.NewSearchEngine([]string{"name"}, nil, 1)
@@ -232,7 +335,7 @@ func TestLoadEngine_Errors(t *testing.T) {
 		t.Fatalf("POST /load-controller missing indexName expected 400, got %d", rr.Code)
 	}
 
-	t.Setenv("INDEX_DATA_DIR", t.TempDir())
+	t.Setenv("SEARCH52_INDEX_DATA_DIR", t.TempDir())
 	req = httptest.NewRequest(http.MethodPost, "/load-controller", strings.NewReader(`{"indexName":"missing"}`))
 	rr = httptest.NewRecorder()
 	h.LoadEngine(rr, req)
@@ -243,7 +346,7 @@ func TestLoadEngine_Errors(t *testing.T) {
 
 func TestLoadEngine_Success(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("INDEX_DATA_DIR", tmp)
+	t.Setenv("SEARCH52_INDEX_DATA_DIR", tmp)
 
 	se := engine.NewSearchEngineWithFieldWeights(
 		[]string{"name", "tags"},
@@ -290,8 +393,39 @@ func TestLoadEngine_Success(t *testing.T) {
 	if loaded.FieldWeights["name"] != 3 || loaded.FieldWeights["tags"] != 1 {
 		t.Fatalf("expected restored field weights, got %+v", loaded.FieldWeights)
 	}
-	assertEngineSearchIDs(t, loaded.SearchOneTerm("sunny", nil), "1")
-	assertEngineSearchIDs(t, loaded.SearchOneTerm("sunny", map[string][]interface{}{"year": {"2020"}}), "1")
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, loaded, "sunny", nil), "1")
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, loaded, "sunny", map[string][]interface{}{"year": {"2020"}}), "1")
+}
+
+func TestLoadEngine_CorruptPayloadKeepsExistingIndex(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SEARCH52_INDEX_DATA_DIR", tmp)
+
+	existing := engine.NewSearchEngine([]string{"name"}, nil, 10)
+	if err := existing.AddOrUpdateDocument(map[string]interface{}{
+		"id": "existing", "name": "kept alive",
+	}); err != nil {
+		t.Fatalf("AddOrUpdateDocument: %v", err)
+	}
+
+	dataDir := filepath.Join(tmp, "idx")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "engine.gob"), []byte("not a gob"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	h := NewHTTP()
+	h.engines["idx"] = existing
+	req := httptest.NewRequest(http.MethodPost, "/load-controller", strings.NewReader(`{"indexName":"idx"}`))
+	rr := httptest.NewRecorder()
+	h.LoadEngine(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, h.engines["idx"], "kept", nil), "existing")
 }
 
 func TestSearchHandler_Errors(t *testing.T) {
@@ -310,6 +444,21 @@ func TestSearchHandler_Errors(t *testing.T) {
 	h.Search(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("GET /search missing index expected 400, got %d", rr.Code)
+	}
+
+	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+	req = httptest.NewRequest(http.MethodGet, "/search?index=idx&q="+strings.Repeat("a", maxQueryLength+1), nil)
+	rr = httptest.NewRecorder()
+	h.Search(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("GET /search oversized query expected 400, got %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/search?index=idx&q=x&filter=category:books", nil)
+	rr = httptest.NewRecorder()
+	h.Search(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("GET /search unconfigured filter expected 400, got %d", rr.Code)
 	}
 }
 
@@ -332,7 +481,7 @@ func TestCreateIndexHandler_Errors(t *testing.T) {
 	}
 
 	// Missing indexName
-	body := `{"indexFields":["f"],"filters":[],"resultCount":1,"workers":1}`
+	body := `{"indexFields":["f"],"filters":[],"resultCount":1}`
 	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(body))
 	rr = httptest.NewRecorder()
 	h.CreateIndex(rr, req)
@@ -341,7 +490,7 @@ func TestCreateIndexHandler_Errors(t *testing.T) {
 	}
 
 	// Already exists
-	valid := `{"indexName":"dup","indexFields":["f"],"filters":[],"resultCount":1,"workers":1}`
+	valid := `{"indexName":"dup","indexFields":["f"],"filters":[],"resultCount":1}`
 	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(valid))
 	rr = httptest.NewRecorder()
 	h.CreateIndex(rr, req)
@@ -351,6 +500,22 @@ func TestCreateIndexHandler_Errors(t *testing.T) {
 	h.CreateIndex(rr, req)
 	if rr.Code != http.StatusConflict {
 		t.Errorf("POST /create-index duplicate expected 409, got %d", rr.Code)
+	}
+
+	invalidWeight := `{"indexName":"badweight","indexFields":["f"],"fieldWeights":{"other":2},"resultCount":1}`
+	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(invalidWeight))
+	rr = httptest.NewRecorder()
+	h.CreateIndex(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("POST /create-index invalid fieldWeights expected 400, got %d", rr.Code)
+	}
+
+	unknownField := `{"indexName":"unknown","indexFields":["f"],"resultCount":1,"workers":1}`
+	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(unknownField))
+	rr = httptest.NewRecorder()
+	h.CreateIndex(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("POST /create-index unknown field expected 400, got %d", rr.Code)
 	}
 }
 
@@ -447,8 +612,8 @@ func TestAddToIndexHandler_JSONSuccess(t *testing.T) {
 	if resp.AddedCount != 2 || resp.TotalDocs != 2 {
 		t.Fatalf("unexpected add response: %+v", resp)
 	}
-	assertEngineSearchIDs(t, h.engines["idx"].SearchOneTerm("sunny", nil), "1")
-	assertEngineSearchIDs(t, h.engines["idx"].SearchOneTerm("cloudy", nil), "2")
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, h.engines["idx"], "sunny", nil), "1")
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, h.engines["idx"], "cloudy", nil), "2")
 }
 
 func TestAddToIndexHandler_CSVSuccess(t *testing.T) {
@@ -481,7 +646,7 @@ func TestAddToIndexHandler_CSVSuccess(t *testing.T) {
 	if resp.AddedCount != 2 || resp.TotalDocs != 2 {
 		t.Fatalf("unexpected add response: %+v", resp)
 	}
-	assertEngineSearchIDs(t, h.engines["idx"].SearchOneTerm("rio", nil), "1")
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, h.engines["idx"], "rio", nil), "1")
 }
 
 func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
@@ -577,6 +742,42 @@ func TestDeleteDocumentHandler_Errors(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("DELETE /document index not found expected 404, got %d", rr.Code)
 	}
+}
+
+func TestCompactIndexHandler(t *testing.T) {
+	h := NewHTTP()
+	se := engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "name": "old title", "year": "2020"}); err != nil {
+		t.Fatalf("AddOrUpdateDocument old: %v", err)
+	}
+	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "name": "new title", "year": "2021"}); err != nil {
+		t.Fatalf("AddOrUpdateDocument new: %v", err)
+	}
+	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "2", "name": "delete me", "year": "2022"}); err != nil {
+		t.Fatalf("AddOrUpdateDocument deleted: %v", err)
+	}
+	if ok := se.DeleteDocument("2"); !ok {
+		t.Fatal("DeleteDocument(2) expected true")
+	}
+	h.engines["idx"] = se
+
+	req := httptest.NewRequest(http.MethodPost, "/compact-index", strings.NewReader(`{"indexName":"idx"}`))
+	rr := httptest.NewRecorder()
+	h.CompactIndex(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("compact expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp CompactIndexResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode compact response: %v", err)
+	}
+	if resp.Stats.BeforeStored != 3 || resp.Stats.AfterStored != 1 || resp.Stats.RemovedVersions != 2 {
+		t.Fatalf("unexpected compact stats: %+v", resp.Stats)
+	}
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, h.engines["idx"], "new", nil), "1")
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, h.engines["idx"], "old", nil))
+	assertEngineSearchIDs(t, mustSearchOneTerm(t, h.engines["idx"], "delete", nil))
 }
 
 func TestDocumentEndpoints_E2E_AddUpdateDeleteSearch(t *testing.T) {

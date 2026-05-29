@@ -5,10 +5,13 @@
 package engine
 
 import (
+	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -28,6 +31,25 @@ type ReturnedDocument struct {
 
 type SearchResult struct {
 	Docs []ReturnedDocument
+}
+
+var ErrSearchCanceled = errors.New("search canceled")
+
+type IndexStats struct {
+	ActiveDocuments int
+	StoredDocuments int
+	IndexFields     []string
+	FieldWeights    map[string]int
+	Filters         map[string]bool
+	ResultSize      int
+}
+
+type CompactStats struct {
+	BeforeStored    int `json:"beforeStored"`
+	BeforeActive    int `json:"beforeActive"`
+	AfterStored     int `json:"afterStored"`
+	AfterActive     int `json:"afterActive"`
+	RemovedVersions int `json:"removedVersions"`
 }
 
 // enginePayload is the gob-serializable snapshot of SearchEngine state.
@@ -97,6 +119,41 @@ func NewSearchEngineWithFieldWeights(indexFields []string, fieldWeights map[stri
 	}
 }
 
+func (se *SearchEngine) Stats() IndexStats {
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	active := 0
+	for _, internalID := range se.ExternalToInternal {
+		if !se.DocDeleted[internalID] {
+			active++
+		}
+	}
+
+	return IndexStats{
+		ActiveDocuments: active,
+		StoredDocuments: len(se.Documents),
+		IndexFields:     append([]string(nil), se.IndexFields...),
+		FieldWeights:    copyIntMap(se.FieldWeights),
+		Filters:         copyBoolMap(se.Filters),
+		ResultSize:      se.ResultSize,
+	}
+}
+
+func (se *SearchEngine) FilterFields() map[string]bool {
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	return copyBoolMap(se.Filters)
+}
+
+func (se *SearchEngine) StoredDocumentCount() int {
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	return len(se.Documents)
+}
+
 func init() {
 	gob.Register(enginePayload{})
 	gob.Register(Document{})
@@ -154,6 +211,9 @@ func LoadAll(path string) (*SearchEngine, error) {
 	if err := dec.Decode(&payload); err != nil {
 		return nil, fmt.Errorf("decode engine payload: %w", err)
 	}
+	if err := validatePayload(payload); err != nil {
+		return nil, fmt.Errorf("invalid engine payload: %w", err)
+	}
 
 	// Base engine (derived fields empty; we will rebuild)
 	se := &SearchEngine{
@@ -182,6 +242,9 @@ func LoadAll(path string) (*SearchEngine, error) {
 	se.FieldWeights = normalizeFieldWeights(se.IndexFields, payload.FieldWeights)
 	se.Filters = payload.Filters
 	se.ResultSize = payload.ResultSize
+	if se.ResultSize <= 0 {
+		se.ResultSize = 100
+	}
 
 	// Safety: if NextInternalID missing/zero in older payloads
 	if se.nextInternalID == 0 {
@@ -254,6 +317,36 @@ func LoadAll(path string) (*SearchEngine, error) {
 	}
 
 	return se, nil
+}
+
+func validatePayload(payload enginePayload) error {
+	if payload.Documents == nil {
+		return errors.New("missing documents")
+	}
+	if payload.DocDeleted == nil {
+		return errors.New("missing deleted document map")
+	}
+	if payload.ExternalToInternal == nil {
+		return errors.New("missing external ID map")
+	}
+	if payload.InternalToExternal == nil {
+		return errors.New("missing internal ID map")
+	}
+	if len(payload.IndexFields) == 0 {
+		return errors.New("missing index fields")
+	}
+	if payload.ResultSize < 0 {
+		return errors.New("negative result size")
+	}
+	for ext, internal := range payload.ExternalToInternal {
+		if ext == "" || internal == 0 {
+			return fmt.Errorf("invalid external mapping %q -> %d", ext, internal)
+		}
+		if payload.InternalToExternal[internal] != ext {
+			return fmt.Errorf("inconsistent ID mapping for %q", ext)
+		}
+	}
+	return nil
 }
 
 // -------------------- Indexing --------------------
@@ -398,38 +491,152 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 	}
 }
 
-// -------------------- Search --------------------
+// CompactDeleted rebuilds every derived structure and drops tombstoned old
+// document versions. Active external IDs are preserved, while internal IDs are
+// reassigned densely from 1.
+func (se *SearchEngine) CompactDeleted() CompactStats {
+	se.mu.Lock()
+	defer se.mu.Unlock()
 
+	beforeStored := len(se.Documents)
+	beforeActive := se.activeDocumentCountLocked()
+
+	type activeDoc struct {
+		externalID string
+		doc        map[string]interface{}
+	}
+	active := make([]activeDoc, 0, beforeActive)
+	for externalID, internalID := range se.ExternalToInternal {
+		if se.DocDeleted[internalID] {
+			continue
+		}
+		doc := se.Documents[internalID]
+		if doc == nil {
+			continue
+		}
+		active = append(active, activeDoc{
+			externalID: externalID,
+			doc:        copyDocument(doc),
+		})
+	}
+	sort.Slice(active, func(i, j int) bool {
+		return active[i].externalID < active[j].externalID
+	})
+
+	indexFields := append([]string(nil), se.IndexFields...)
+	fieldWeights := copyIntMap(se.FieldWeights)
+	filters := copyBoolMap(se.Filters)
+
+	se.DataMap = make(map[string]map[uint32]int)
+	se.DocDeleted = make(map[uint32]bool)
+	se.ExternalToInternal = make(map[string]uint32)
+	se.InternalToExternal = make(map[uint32]string)
+	se.nextInternalID = 1
+	se.Documents = make(map[uint32]map[string]interface{}, len(active))
+	se.FilterBits = make(map[string][]uint64)
+	se.Prefix = make(map[string][]string)
+	se.Symspell = symspell.NewSymSpell()
+	se.termSet = sync.Map{}
+
+	for _, item := range active {
+		internalID := se.nextInternalID
+		se.nextInternalID++
+		se.ExternalToInternal[item.externalID] = internalID
+		se.InternalToExternal[internalID] = item.externalID
+		se.Documents[internalID] = item.doc
+
+		for token, score := range weightedTokenScores(item.doc, indexFields, fieldWeights) {
+			se.indexTokenLocked(token, internalID, score)
+		}
+		for field := range filters {
+			value, exists := item.doc[field]
+			if !exists {
+				continue
+			}
+			var filterKey string
+			switch value.(type) {
+			case int, int8, int16, int32, int64, float32, float64:
+				filterKey = fmt.Sprintf("%s:%v", field, value)
+			case string:
+				filterKey = fmt.Sprintf("%s:%s", field, value)
+			default:
+				continue
+			}
+			se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internalID)
+		}
+	}
+
+	afterStored := len(se.Documents)
+	afterActive := se.activeDocumentCountLocked()
+	return CompactStats{
+		BeforeStored:    beforeStored,
+		BeforeActive:    beforeActive,
+		AfterStored:     afterStored,
+		AfterActive:     afterActive,
+		RemovedVersions: beforeStored - afterStored,
+	}
+}
+
+func (se *SearchEngine) activeDocumentCountLocked() int {
+	active := 0
+	for _, internalID := range se.ExternalToInternal {
+		if !se.DocDeleted[internalID] {
+			active++
+		}
+	}
+	return active
+}
+
+func copyDocument(doc map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(doc))
+	for k, v := range doc {
+		out[k] = v
+	}
+	return out
+}
+
+// -------------------- Search --------------------
 // SearchOneTerm returns the top-k matching documents for a single term, ranked
 // by score descending. If filters is non-empty, only documents passing the
 // filter are considered. The whole function holds RLock to avoid concurrent
 // map read/write panics with index updates.
-func (se *SearchEngine) SearchOneTerm(query string, filters map[string][]interface{}) []ReturnedDocument {
+func (se *SearchEngine) SearchOneTerm(ctx context.Context, query string, filters map[string][]interface{}) ([]ReturnedDocument, error) {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, ErrSearchCanceled
+	}
 
 	var allowed []uint64
 	if len(filters) > 0 {
 		allowed = se.applyFilterLocked(filters)
 		if allowed == nil {
-			return nil
+			return nil, nil
 		}
 	}
 
 	postings := se.DataMap[query]
 	if len(postings) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	k := se.ResultSize
 	if k <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	deleted := se.DocDeleted
 	h := make([]internalHit, 0, k)
 
+	scanned := 0
 	for id, score := range postings {
+		scanned++
+		if scanned%1024 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, ErrSearchCanceled
+			}
+		}
 		if deleted[id] {
 			continue
 		}
@@ -446,7 +653,7 @@ func (se *SearchEngine) SearchOneTerm(query string, filters map[string][]interfa
 
 	n := len(h)
 	if n == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Extract in descending order via repeated heap-pop.
@@ -465,32 +672,36 @@ func (se *SearchEngine) SearchOneTerm(query string, filters map[string][]interfa
 			Score: hit.score,
 		}
 	}
-	return out
+	return out, nil
 }
 
 // SearchMultiTerms returns the top-k matching documents for a multi-term query
 // expressed as groups of synonyms. Semantics: AND across groups, OR within a
 // group. If filters is non-empty, only documents passing the filter are
 // considered. RLock is held for the whole function.
-func (se *SearchEngine) SearchMultiTerms(termArrList [][]string, filters map[string][]interface{}) []ReturnedDocument {
+func (se *SearchEngine) SearchMultiTerms(ctx context.Context, termArrList [][]string, filters map[string][]interface{}) ([]ReturnedDocument, error) {
 	if len(termArrList) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, ErrSearchCanceled
+	}
+
 	var allowed []uint64
 	if len(filters) > 0 {
 		allowed = se.applyFilterLocked(filters)
 		if allowed == nil {
-			return nil
+			return nil, nil
 		}
 	}
 
 	k := se.ResultSize
 	if k <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	dataMap := se.DataMap
@@ -499,7 +710,7 @@ func (se *SearchEngine) SearchMultiTerms(termArrList [][]string, filters map[str
 
 	for i, terms := range termArrList {
 		if len(terms) == 0 {
-			return nil
+			return nil, nil
 		}
 
 		group := make([]map[uint32]int, 0, len(terms))
@@ -513,7 +724,7 @@ func (se *SearchEngine) SearchMultiTerms(termArrList [][]string, filters map[str
 		}
 
 		if len(group) == 0 {
-			return nil
+			return nil, nil
 		}
 
 		groups[i] = group
@@ -541,8 +752,15 @@ func (se *SearchEngine) SearchMultiTerms(termArrList [][]string, filters map[str
 	deleted := se.DocDeleted
 	h := make([]internalHit, 0, k)
 
+	scanned := 0
 	for _, anchorMap := range anchorGroup {
 		for internalID, score := range anchorMap {
+			scanned++
+			if scanned%1024 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, ErrSearchCanceled
+				}
+			}
 			if visited != nil {
 				if _, seen := visited[internalID]; seen {
 					continue
@@ -594,7 +812,7 @@ func (se *SearchEngine) SearchMultiTerms(termArrList [][]string, filters map[str
 
 	n := len(h)
 	if n == 0 {
-		return nil
+		return nil, nil
 	}
 
 	extMap := se.InternalToExternal
@@ -612,7 +830,7 @@ func (se *SearchEngine) SearchMultiTerms(termArrList [][]string, filters map[str
 			Score: hit.score,
 		}
 	}
-	return out
+	return out, nil
 }
 
 // applyFilterLocked resolves filters to a bitset without acquiring any lock.
@@ -730,18 +948,22 @@ func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) []uint64 {
 
 // Search executes a query (single or multi-term), selecting between exact/prefix/fuzzy strategies.
 func (se *SearchEngine) Search(query string, filters map[string][]interface{}) *SearchResult {
+	res, _ := se.SearchContext(context.Background(), query, filters)
+	return res
+}
+
+func (se *SearchEngine) SearchContext(ctx context.Context, query string, filters map[string][]interface{}) (*SearchResult, error) {
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
-		return nil
+		return nil, nil
 	} else if len(queryTokens) == 1 {
-		return se.SingleTermSearch(queryTokens, filters)
+		return se.SingleTermSearch(ctx, queryTokens, filters)
 	} else {
-		return se.MultiTermSearch(queryTokens, filters)
+		return se.MultiTermSearch(ctx, queryTokens, filters)
 	}
 }
 
-// SingleTermSearch resolves a single-token query via prefix (preferred) or fuzzy expansions.
-func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[string][]interface{}) *SearchResult {
+func (se *SearchEngine) SingleTermSearch(ctx context.Context, queryTokens []string, filters map[string][]interface{}) (*SearchResult, error) {
 	parsedQuery := make(map[string][]string)
 	// TODO: make it var in the engine definition
 	maxPrefixTokens := 3
@@ -769,39 +991,49 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[strin
 
 	var finalDocs []ReturnedDocument
 	if exactExists {
-		finalDocs = append(finalDocs, se.SearchOneTerm(queryTokens[0], filters)...)
+		docs, err := se.SearchOneTerm(ctx, queryTokens[0], filters)
+		if err != nil {
+			return nil, err
+		}
+		finalDocs = append(finalDocs, docs...)
 	}
 	if parsedQuery["prefix"] != nil {
 		for _, q := range parsedQuery["prefix"] {
-			finalDocs = append(finalDocs, se.SearchOneTerm(q, filters)...)
+			docs, err := se.SearchOneTerm(ctx, q, filters)
+			if err != nil {
+				return nil, err
+			}
+			finalDocs = append(finalDocs, docs...)
 		}
 		limit := se.ResultSize
 		if len(finalDocs) < limit {
 			limit = len(finalDocs)
 		}
-		return &SearchResult{Docs: finalDocs[0:limit]}
+		return &SearchResult{Docs: finalDocs[0:limit]}, nil
 	}
 	if parsedQuery["fuzzy"] != nil {
 		for _, q := range parsedQuery["fuzzy"] {
-			finalDocs = append(finalDocs, se.SearchOneTerm(q, filters)...)
+			docs, err := se.SearchOneTerm(ctx, q, filters)
+			if err != nil {
+				return nil, err
+			}
+			finalDocs = append(finalDocs, docs...)
 		}
 		limit := se.ResultSize
 		if len(finalDocs) < limit {
 			limit = len(finalDocs)
 		}
-		return &SearchResult{Docs: finalDocs[0:limit]}
+		return &SearchResult{Docs: finalDocs[0:limit]}, nil
 	}
 
 	limit := se.ResultSize
 	if len(finalDocs) < limit {
 		limit = len(finalDocs)
 	}
-	return &SearchResult{Docs: finalDocs[0:limit]}
+	return &SearchResult{Docs: finalDocs[0:limit]}, nil
 }
 
-// MultiTermSearch executes a multi-token query using grouped boolean search strategies.
-// First terms: exact match + fuzzy(10). Last term: exact match + adaptive prefix expansion.
-func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string][]interface{}) *SearchResult {
+func (se *SearchEngine) MultiTermSearch(ctx context.Context, queryTokens []string, filters map[string][]interface{}) (*SearchResult, error) {
 	lastQueryIndex := len(queryTokens) - 1
 	rawFirstTerms := queryTokens[:lastQueryIndex]
 	rawLastTerm := queryTokens[lastQueryIndex]
@@ -820,7 +1052,7 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string
 			termArrList[k] = []string{firstTerm}
 		}
 		// TODO: make it var in the engine definition
-		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, 10)...)
+		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, fuzzyLimitForQuery(firstTerm))...)
 	}
 	se.mu.RUnlock()
 
@@ -829,7 +1061,11 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string
 	}
 	termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], lastTermGuessArr...)
 
-	return &SearchResult{Docs: se.SearchMultiTerms(termArrList, filters)}
+	docs, err := se.SearchMultiTerms(ctx, termArrList, filters)
+	if err != nil {
+		return nil, err
+	}
+	return &SearchResult{Docs: docs}, nil
 }
 
 // AddOrUpdateDocument inserts or updates a single document.

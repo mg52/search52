@@ -3,6 +3,7 @@
 // Usage:
 //
 //	go run ./cmd/bench vocab      [-size 100000] [-out vocab.txt]
+//	go run ./cmd/bench vocab      [-data docs.json] [-fields title,tags] [-out vocab.txt]
 //	go run ./cmd/bench datagen    [-count 1000000] [-vocab vocab.txt] [-out data.json]
 //	go run ./cmd/bench benchmark  [-data data.json] [-vocab vocab.txt] [-queries 5000]
 //	go run ./cmd/bench loadtest   [-url http://localhost:8080/search] [-vocab vocab.txt] [-requests 10000]
