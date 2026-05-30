@@ -32,11 +32,7 @@ Index/load summary:
 | Documents indexed | 5 000 000 |
 | JSON file size | 585 MB |
 | Vocabulary size | All unique tokens from `title`, `artist`, `album` |
-| InsertDocs time | 5.73 s |
-| BuildDocumentIndex time | 87.89 s |
-| Engine-reported total index time | 93.63 s |
-| HTTP upload wall time | 102.81 s |
-| Service RSS after load test | ~3.85 GiB |
+| Total index time | 94.85 s |
 
 HTTP load-test results:
 
@@ -44,11 +40,11 @@ The load-test client drains each response body before recording latency.
 
 | Scope | Workers | Queries | Errors | HTTP statuses | Wall time | RPS | avg | p50 | p95 | p99 |
 |---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| Overall | 16 | 100 000 | 0 | 200:100000 | 3.028 s | 33 020.9 | 0.48 ms | 0.33 ms | 1.18 ms | 3.00 ms |
-| Single / NoFilter | 16 | 25 000 | 0 | 200 | - | - | 0.61 ms | 0.45 ms | 1.35 ms | 3.66 ms |
-| Single / Filter | 16 | 25 000 | 0 | 200 | - | - | 0.46 ms | 0.31 ms | 1.23 ms | 2.67 ms |
-| Multi / NoFilter | 16 | 25 000 | 0 | 200 | - | - | 0.43 ms | 0.29 ms | 1.09 ms | 3.32 ms |
-| Multi / Filter | 16 | 25 000 | 0 | 200 | - | - | 0.41 ms | 0.29 ms | 0.98 ms | 2.51 ms |
+| Overall | 16 | 100 000 | 0 | 200:100000 | 20.349 s | 4 914.4 | 3.24 ms | 1.78 ms | 11.41 ms | 21.33 ms |
+| Single / NoFilter | 16 | 25 000 | 0 | 200:25000 | 20.349 s | 1 228.6 | 4.30 ms | 1.83 ms | 15.40 ms | 26.51 ms |
+| Single / Filter | 16 | 25 000 | 0 | 200:25000 | 20.349 s | 1 228.6 | 2.57 ms | 1.13 ms | 10.23 ms | 21.41 ms |
+| Multi / NoFilter | 16 | 25 000 | 0 | 200:25000 | 20.349 s | 1 228.6 | 3.28 ms | 2.24 ms | 8.92 ms | 17.80 ms |
+| Multi / Filter | 16 | 25 000 | 0 | 200:25000 | 20.349 s | 1 228.6 | 2.80 ms | 1.89 ms | 7.90 ms | 15.15 ms |
 
 ### In-process benchmark
 
