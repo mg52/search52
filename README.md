@@ -23,39 +23,7 @@ All numbers are from an Apple M1 Pro. The MusicBrainz load test uses the real `m
 
 Environment: Apple M1 Pro, darwin/arm64, Go 1.25.4, `GOMAXPROCS=10`.
 
-Dataset: `mb_5m.json`, 5 000 000 MusicBrainz documents, 585 MB JSON. Index fields: `title`, `artist`, `album`. Filter field: `year`. Result size: 100. Hard-coded prefix map cap: 5 000. Multi-term last-token prefix expansion is adaptive: 100 completions for 1-2 chars, 60 for 3-5 chars, and 50 after that. Query vocabulary: all unique tokens extracted from the same indexed text fields. Query generation used the same rules as `benchmark.go`: single-term queries are 65% exact, 25% prefix, 10% misspelled; multi-term queries use 2-4 tokens, 10% have one misspelled token, and the last token is prefix-truncated 25% of the time. `-mode-mix balanced` sends equal traffic to Single/NoFilter, Single/Filter, Multi/NoFilter, and Multi/Filter.
-
-Setup:
-
-```bash
-go run ./cmd/bench vocab \
-  -data mb_5m.json \
-  -fields title,artist,album \
-  -out mb_vocab.txt
-
-go run ./cmd/service
-
-curl -X POST http://127.0.0.1:8080/create-index \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "indexName":"mb5m",
-    "indexFields":["title","artist","album"],
-    "filters":["year"],
-    "resultCount":100
-  }'
-
-curl -X POST 'http://127.0.0.1:8080/add-to-index?indexName=mb5m' \
-  -F 'file=@mb_5m.json'
-
-go run ./cmd/bench loadtest \
-  -url http://127.0.0.1:8080/search \
-  -vocab mb_vocab.txt \
-  -index mb5m \
-  -requests 100000 \
-  -workers 16 \
-  -seed 99 \
-  -mode-mix balanced
-```
+Dataset: `mb_5m.json`, 5 000 000 MusicBrainz documents, 585 MB JSON. Index fields: `title`, `artist`, `album`. Filter field: `year`. Result size: 100. Hard-coded prefix map cap: 5 000. Multi-term last-token prefix expansion is adaptive: 100 completions for 1-2 chars, 60 for 3-5 chars, and 50 after that. Query vocabulary: all unique tokens extracted from the same indexed text fields. Single-term queries are 65% exact, 25% prefix, 10% misspelled; multi-term queries use 2-4 tokens, 10% have one misspelled token, and the last token is prefix-truncated 25% of the time. `-mode-mix balanced` sends equal traffic to Single/NoFilter, Single/Filter, Multi/NoFilter, and Multi/Filter.
 
 Index/load summary:
 
@@ -84,10 +52,7 @@ The load-test client drains each response body before recording latency.
 
 ### In-process benchmark
 
-```bash
-go run ./cmd/bench benchmark -data data.json   -vocab vocab.txt -queries 10000 -warmup 1000
-go run ./cmd/bench benchmark -data data5m.json -vocab vocab.txt -queries 10000 -warmup 1000
-```
+This benchmark runs entirely inside the Go process: it loads a JSON dataset, builds the engine in memory, warms up query paths, and measures search latency without HTTP/network overhead.
 
 #### 1 M docs — heap delta ~800 MB
 
@@ -108,6 +73,8 @@ go run ./cmd/bench benchmark -data data5m.json -vocab vocab.txt -queries 10000 -
 | MultiTerm  / Filter   | 46.9 µs | 43.0 µs | 173.9 µs |  3 492 | 27 |
 
 Filter queries are faster than no-filter equivalents because the bitset pre-prunes the candidate set before the posting-list scan.
+
+Bench tooling documentation lives in [cmd/bench/README.md](cmd/bench/README.md)
 
 ---
 
@@ -436,132 +403,6 @@ go tool cover -func=coverage.out
 ```
 
 ---
-
-## Benchmarking & Load Testing
-
-All data-generation and testing tools live in a single binary under `cmd/bench`.
-
-```
-go run ./cmd/bench <command> [flags]
-
-commands:
-  vocab      generate vocabulary.txt
-  datagen    generate a JSON document file
-  benchmark  run an in-process latency benchmark from a JSON file
-  loadtest   hammer a running HTTP search endpoint
-```
-
-### Step 1 — generate vocabulary
-
-```bash
-go run ./cmd/bench vocab -size 100000 -out vocab.txt
-
-# Or extract vocabulary from a real JSON dataset
-go run ./cmd/bench vocab \
-  -data mb_5m.json \
-  -fields title,artist,album \
-  -out mb_vocab.txt
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `-size` | `100000` | Number of unique mock words to generate when `-data` is not set |
-| `-out` | `vocab.txt` | Output file |
-| `-seed` | `42` | RNG seed |
-| `-data` | `""` | Optional JSON document file to extract vocabulary from. When set, all unique tokens from `-fields` are written. |
-| `-fields` | `title,tags` | Comma-separated fields to extract when `-data` is set |
-
-### Step 2 — generate documents
-
-```bash
-# 1 million documents
-go run ./cmd/bench datagen -count 1000000 -vocab vocab.txt -out data.json
-
-
-# 5 million documents
-go run ./cmd/bench datagen -count 5000000 -vocab vocab.txt -out data5m.json
-```
-
-Generated documents look like:
-
-```json
-{"id":"d0","title":"rukpttue nhuks ghejk vgzadxl ptneuv","tags":"ghejk nhuks","year":2017}
-```
-
-Fields: `title` (3–20 words), `tags` (1–10 words), `year` (2000–2024).
-
-| Flag | Default | Description |
-|---|---|---|
-| `-count` | `1000000` | Number of documents |
-| `-vocab` | `vocab.txt` | Vocabulary file (from `vocab` command) |
-| `-out` | `data.json` | Output JSON file |
-| `-seed` | `42` | RNG seed |
-
-### Step 3 — in-process benchmark
-
-Reads the JSON file, builds the engine in memory, then runs search queries measuring latency. No HTTP server needed.
-
-```bash
-go run ./cmd/bench benchmark -data data.json -vocab vocab.txt -queries 10000 -warmup 1000
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `-data` | `data.json` | JSON data file |
-| `-vocab` | `vocab.txt` | Vocabulary file |
-| `-queries` | `5000` | Queries measured per mode |
-| `-warmup` | `500` | Warmup iterations before measuring |
-| `-result-size` | `100` | Top-k result size |
-| `-seed` | `99` | RNG seed for query generation |
-
-### Step 4 — HTTP load test
-
-Start the service and load data, then run the load test.
-
-```bash
-go run ./cmd/service
-
-# create index
-curl -X POST http://localhost:8080/create-index \
-  -H 'Content-Type: application/json' \
-  -d '{"indexName":"bench","indexFields":["title","tags"],"filters":["year"],"resultCount":100}'
-
-# upload 1 M docs
-curl -X POST 'http://localhost:8080/add-to-index?indexName=bench' \
-  -F 'file=@data.json'
-
-# run load test
-go run ./cmd/bench loadtest \
-  -url http://localhost:8080/search \
-  -vocab vocab.txt \
-  -index bench \
-  -requests 10000 \
-  -workers 16 \
-  -mode-mix balanced
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `-url` | `http://localhost:8080/search` | Search endpoint |
-| `-vocab` | `vocab.txt` | Vocabulary file |
-| `-index` | `bench` | Index name |
-| `-workers` | `8` | Parallel goroutines |
-| `-requests` | `10000` | Total requests |
-| `-filter-pct` | `50` | % of requests with a year filter |
-| `-multi-pct` | `50` | % of multi-term queries |
-| `-mode-mix` | `random` | `random` uses `filter-pct`/`multi-pct`; `balanced` cycles evenly through the four benchmark modes |
-| `-timeout` | `10s` | Per-request HTTP timeout |
-| `-seed` | random | RNG seed for reproducibility |
-| `-keepalive` | `true` | Use HTTP keep-alive |
-
-The load-test command pre-generates query pools sized to the request count, with a minimum of 1 000. For `-requests 100000`, it builds 100 000 single-term queries, 100 000 multi-term queries, and 100 000 year filters, then selects by request index. In `balanced` mode this keeps the four traffic modes evenly split without cycling through only a tiny 1 000-query pool.
-
-When the run finishes it prints Markdown tables:
-
-- `Load test totals`: requested total requests, processed total requests, total duration, and requests per second.
-- `Load test summary`: overall and per-mode latency, status, error, RPS, p50/p95/p99.
-- `Load test configuration`: target URL, index, vocab size, query pool size, workers, seed, timeout, and runtime settings.
-- `Query generation details`: actual generated counts for single exact/prefix/misspelled queries and multi-term misspelled/prefix/term-count distribution.
 
 ## License
 
