@@ -175,7 +175,7 @@ The engine uses a single `sync.RWMutex` plus a lock-free `termSet`:
 - Index writes (`InsertDocs`, `BuildDocumentIndex`, `AddOrUpdateDocument`) hold **`Lock`** — exclusive, blocks new readers until the write completes.
 - **`termSet sync.Map`** — a lock-free set of every indexed term. `SingleTermSearch` and `MultiTermSearch` check exact-term existence here before acquiring `RLock`, avoiding a mutex round-trip for the common case.
 
-`SearchOneTerm` and `SearchMultiTerms` acquire `RLock` **once at the top** and hold it across both filter resolution and the posting-map scan:
+`SingleTermSearchLoop` and `MultiTermSearchLoop` acquire `RLock` **once at the top** and hold it across both filter resolution and the posting-map scan:
 
 ```
 RLock acquired

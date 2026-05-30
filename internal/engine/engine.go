@@ -366,6 +366,11 @@ func (se *SearchEngine) Index(docs []map[string]interface{}) {
 	start = time.Now()
 	se.BuildDocumentIndex(docs)
 	slog.Info("BuildDocumentIndex done", "duration", time.Since(start))
+
+	slog.Info("UpdatePrefix starting")
+	start = time.Now()
+	se.UpdatePrefix()
+	slog.Info("UpdatePrefix done", "duration", time.Since(start))
 }
 
 // InsertDocs materializes raw documents into the Documents store without reindexing.
@@ -427,6 +432,54 @@ func (se *SearchEngine) indexTokenLocked(term string, id uint32, score int) {
 		se.DataMap[term] = docMap
 	}
 	docMap[id] += score
+}
+
+// UpdatePrefix rebuilds the prefix lookup from currently-active postings and
+// orders each prefix list by active document frequency descending.
+func (se *SearchEngine) UpdatePrefix() {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+
+	se.updatePrefixLocked()
+}
+
+// updatePrefixLocked rebuilds Prefix from DataMap. Caller must hold se.mu.Lock().
+func (se *SearchEngine) updatePrefixLocked() {
+	type termFreq struct {
+		term string
+		freq int
+	}
+
+	terms := make([]termFreq, 0, len(se.DataMap))
+	for term, postings := range se.DataMap {
+		freq := 0
+		for internalID := range postings {
+			if !se.DocDeleted[internalID] {
+				freq++
+			}
+		}
+		if freq > 0 {
+			terms = append(terms, termFreq{term: term, freq: freq})
+		}
+	}
+
+	sort.Slice(terms, func(i, j int) bool {
+		if terms[i].freq != terms[j].freq {
+			return terms[i].freq > terms[j].freq
+		}
+		return terms[i].term < terms[j].term
+	})
+
+	prefix := make(map[string][]string)
+	for _, tf := range terms {
+		for i := 1; i < len(tf.term); i++ {
+			pfx := tf.term[:i]
+			if len(prefix[pfx]) < MaxPrefixTerms {
+				prefix[pfx] = append(prefix[pfx], tf.term)
+			}
+		}
+	}
+	se.Prefix = prefix
 }
 
 // BuildDocumentIndex tokenizes index fields and updates the inverted index and filters.
@@ -565,6 +618,7 @@ func (se *SearchEngine) CompactDeleted() CompactStats {
 			se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internalID)
 		}
 	}
+	se.updatePrefixLocked()
 
 	afterStored := len(se.Documents)
 	afterActive := se.activeDocumentCountLocked()
@@ -596,11 +650,11 @@ func copyDocument(doc map[string]interface{}) map[string]interface{} {
 }
 
 // -------------------- Search --------------------
-// SearchOneTerm returns the top-k matching documents for a single term, ranked
+// SingleTermSearchLoop returns the top-k matching documents for a single term, ranked
 // by score descending. If filters is non-empty, only documents passing the
 // filter are considered. The whole function holds RLock to avoid concurrent
 // map read/write panics with index updates.
-func (se *SearchEngine) SearchOneTerm(ctx context.Context, query string, filters map[string][]interface{}) ([]ReturnedDocument, error) {
+func (se *SearchEngine) SingleTermSearchLoop(ctx context.Context, query string, filters map[string][]interface{}) ([]ReturnedDocument, error) {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
@@ -646,11 +700,15 @@ func (se *SearchEngine) SearchOneTerm(ctx context.Context, query string, filters
 
 		if len(h) < k {
 			h = heapPushHit(h, internalHit{id: id, score: score})
+			if len(h) >= k && SkipWholeScan {
+				goto BreakLoop
+			}
 		} else if h[0].score < score {
 			heapReplaceTop(h, internalHit{id: id, score: score})
 		}
 	}
 
+BreakLoop:
 	n := len(h)
 	if n == 0 {
 		return nil, nil
@@ -675,11 +733,11 @@ func (se *SearchEngine) SearchOneTerm(ctx context.Context, query string, filters
 	return out, nil
 }
 
-// SearchMultiTerms returns the top-k matching documents for a multi-term query
+// MultiTermSearchLoop returns the top-k matching documents for a multi-term query
 // expressed as groups of synonyms. Semantics: AND across groups, OR within a
 // group. If filters is non-empty, only documents passing the filter are
 // considered. RLock is held for the whole function.
-func (se *SearchEngine) SearchMultiTerms(ctx context.Context, termArrList [][]string, filters map[string][]interface{}) ([]ReturnedDocument, error) {
+func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][]string, filters map[string][]interface{}) ([]ReturnedDocument, error) {
 	if len(termArrList) == 0 {
 		return nil, nil
 	}
@@ -804,12 +862,16 @@ func (se *SearchEngine) SearchMultiTerms(ctx context.Context, termArrList [][]st
 
 			if len(h) < k {
 				h = heapPushHit(h, internalHit{id: internalID, score: total})
+				if len(h) >= k && SkipWholeScan {
+					goto BreakLoop
+				}
 			} else if h[0].score < total {
 				heapReplaceTop(h, internalHit{id: internalID, score: total})
 			}
 		}
 	}
 
+BreakLoop:
 	n := len(h)
 	if n == 0 {
 		return nil, nil
@@ -991,7 +1053,7 @@ func (se *SearchEngine) SingleTermSearch(ctx context.Context, queryTokens []stri
 
 	var finalDocs []ReturnedDocument
 	if exactExists {
-		docs, err := se.SearchOneTerm(ctx, queryTokens[0], filters)
+		docs, err := se.SingleTermSearchLoop(ctx, queryTokens[0], filters)
 		if err != nil {
 			return nil, err
 		}
@@ -999,7 +1061,7 @@ func (se *SearchEngine) SingleTermSearch(ctx context.Context, queryTokens []stri
 	}
 	if parsedQuery["prefix"] != nil {
 		for _, q := range parsedQuery["prefix"] {
-			docs, err := se.SearchOneTerm(ctx, q, filters)
+			docs, err := se.SingleTermSearchLoop(ctx, q, filters)
 			if err != nil {
 				return nil, err
 			}
@@ -1013,7 +1075,7 @@ func (se *SearchEngine) SingleTermSearch(ctx context.Context, queryTokens []stri
 	}
 	if parsedQuery["fuzzy"] != nil {
 		for _, q := range parsedQuery["fuzzy"] {
-			docs, err := se.SearchOneTerm(ctx, q, filters)
+			docs, err := se.SingleTermSearchLoop(ctx, q, filters)
 			if err != nil {
 				return nil, err
 			}
@@ -1051,7 +1113,6 @@ func (se *SearchEngine) MultiTermSearch(ctx context.Context, queryTokens []strin
 		if _, ok := se.termSet.Load(firstTerm); ok {
 			termArrList[k] = []string{firstTerm}
 		}
-		// TODO: make it var in the engine definition
 		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, fuzzyLimitForQuery(firstTerm))...)
 	}
 	se.mu.RUnlock()
@@ -1061,7 +1122,7 @@ func (se *SearchEngine) MultiTermSearch(ctx context.Context, queryTokens []strin
 	}
 	termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], lastTermGuessArr...)
 
-	docs, err := se.SearchMultiTerms(ctx, termArrList, filters)
+	docs, err := se.MultiTermSearchLoop(ctx, termArrList, filters)
 	if err != nil {
 		return nil, err
 	}

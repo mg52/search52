@@ -26,7 +26,7 @@ func main() {
 	apiSrv := &http.Server{
 		Addr:              apiAddr,
 		Handler:           newAPIMux(ht),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: 10 * time.Hour,
 	}
 	adminSrv := &http.Server{
 		Addr:              adminAddr,

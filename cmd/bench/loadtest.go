@@ -31,6 +31,7 @@ type loadTestQuery struct {
 	kind       string
 	misspelled bool
 	prefix     bool
+	prefixLen  int
 	terms      int
 }
 
@@ -47,7 +48,17 @@ func runLoadtest(args []string) {
 	filterPct := fs.Int("filter-pct", 50, "Percentage of requests with a year filter (0-100)")
 	multiPct := fs.Int("multi-pct", 50, "Percentage of multi-term queries (0-100)")
 	modeMix := fs.String("mode-mix", "random", "Mode mix: random or balanced. Balanced matches benchmark.go's four modes evenly.")
+	prefixMinLen := fs.Int("prefix-min-len", 1, "Minimum generated prefix length for prefix queries")
+	prefixMaxLen := fs.Int("prefix-max-len", 10, "Maximum generated prefix length for prefix queries")
 	_ = fs.Parse(args)
+	if *prefixMinLen < 1 {
+		fmt.Fprintf(os.Stderr, "prefix-min-len must be >= 1\n")
+		os.Exit(1)
+	}
+	if *prefixMaxLen < *prefixMinLen {
+		fmt.Fprintf(os.Stderr, "prefix-max-len must be >= prefix-min-len\n")
+		os.Exit(1)
+	}
 
 	vocab, err := loadVocabFile(*vocabFile)
 	if err != nil {
@@ -85,8 +96,8 @@ func runLoadtest(args []string) {
 	if queryPool < queryPoolSize {
 		queryPool = queryPoolSize
 	}
-	singleQs := buildLoadtestSingleQueries(querySeed, vocab, queryPool)
-	multiQs := buildLoadtestMultiQueries(querySeed, vocab, queryPool)
+	singleQs := buildLoadtestSingleQueries(querySeed, vocab, queryPool, *prefixMinLen, *prefixMaxLen)
+	multiQs := buildLoadtestMultiQueries(querySeed, vocab, queryPool, *prefixMinLen, *prefixMaxLen)
 	yearFs := buildYearFilters(querySeed, queryPool)
 	yearFilterValue := func(i int) int {
 		values := yearFs[i%len(yearFs)]["year"]
@@ -256,6 +267,8 @@ func runLoadtest(args []string) {
 	fmt.Printf("| Mode mix | %s |\n", *modeMix)
 	fmt.Printf("| Filter pct | %d%% |\n", *filterPct)
 	fmt.Printf("| Multi pct | %d%% |\n", *multiPct)
+	fmt.Printf("| Prefix min length | %d |\n", *prefixMinLen)
+	fmt.Printf("| Prefix max length | %d |\n", *prefixMaxLen)
 	fmt.Printf("| Timeout | %s |\n", *timeout)
 	fmt.Printf("| Keep-alive | %t |\n", *keepAlive)
 	fmt.Printf("| GOMAXPROCS | %d |\n", runtime.GOMAXPROCS(0))
@@ -321,20 +334,39 @@ func statusCountsFromResults(results []loadTestResult) map[int]int {
 	return statuses
 }
 
+func formatIntCounts(counts map[int]int) string {
+	if len(counts) == 0 {
+		return "{}"
+	}
+	keys := make([]int, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%d:%d", key, counts[key]))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
 func printQueryStrategyTable(singleQs, multiQs []loadTestQuery) {
 	singleExact, singlePrefix, singleMisspelled := 0, 0, 0
+	singlePrefixLens := make(map[int]int)
 	for _, q := range singleQs {
 		switch q.kind {
 		case "exact":
 			singleExact++
 		case "prefix":
 			singlePrefix++
+			singlePrefixLens[q.prefixLen]++
 		case "misspelled":
 			singleMisspelled++
 		}
 	}
 
 	multiMisspelled, multiPrefix := 0, 0
+	multiPrefixLens := make(map[int]int)
 	termCounts := make(map[int]int)
 	for _, q := range multiQs {
 		if q.misspelled {
@@ -342,6 +374,7 @@ func printQueryStrategyTable(singleQs, multiQs []loadTestQuery) {
 		}
 		if q.prefix {
 			multiPrefix++
+			multiPrefixLens[q.prefixLen]++
 		}
 		termCounts[q.terms]++
 	}
@@ -349,13 +382,13 @@ func printQueryStrategyTable(singleQs, multiQs []loadTestQuery) {
 	fmt.Printf("\nQuery generation details\n\n")
 	fmt.Printf("| Query set | Pool size | Exact | Prefix | Misspelled | 2 terms | 3 terms | 4 terms | Strategy |\n")
 	fmt.Printf("|---|---:|---:|---:|---:|---:|---:|---:|---|\n")
-	fmt.Printf("| Single-term | %d | %d | %d | %d | - | - | - | 65%% exact, 25%% prefix, 10%% misspelled |\n",
+	fmt.Printf("| Single-term | %d | %d | %d | %d | - | - | - | 65%% exact, 25%% prefix, 10%% misspelled; prefix length uses configured min/max |\n",
 		len(singleQs),
 		singleExact,
 		singlePrefix,
 		singleMisspelled,
 	)
-	fmt.Printf("| Multi-term | %d | - | %d | %d | %d | %d | %d | 2-4 terms; 10%% one misspelled token; last token prefix-truncated 25%% when not misspelled |\n",
+	fmt.Printf("| Multi-term | %d | - | %d | %d | %d | %d | %d | 2-4 terms; 10%% one misspelled token; last token prefix-truncated 25%% when not misspelled; prefix length uses configured min/max |\n",
 		len(multiQs),
 		multiPrefix,
 		multiMisspelled,
@@ -364,30 +397,40 @@ func printQueryStrategyTable(singleQs, multiQs []loadTestQuery) {
 		termCounts[4],
 	)
 	fmt.Printf("| Balanced mode | - | - | - | - | - | - | - | Cycles evenly through Single/NoFilter, Single/Filter, Multi/NoFilter, Multi/Filter |\n")
+
+	fmt.Printf("\nPrefix length details\n\n")
+	fmt.Printf("| Query set | Prefix length counts |\n")
+	fmt.Printf("|---|---|\n")
+	fmt.Printf("| Single-term | %s |\n", formatIntCounts(singlePrefixLens))
+	fmt.Printf("| Multi-term last token | %s |\n", formatIntCounts(multiPrefixLens))
 }
 
 // ---- query helpers ----
 
-func buildLoadtestSingleQueries(r *rand.Rand, vocab []string, count int) []loadTestQuery {
+func buildLoadtestSingleQueries(r *rand.Rand, vocab []string, count, prefixMinLen, prefixMaxLen int) []loadTestQuery {
 	qs := make([]loadTestQuery, count)
 	for i := range qs {
 		word := vocab[r.Intn(len(vocab))]
 		roll := r.Float64()
 		kind := "exact"
+		prefixLen := 0
 		switch {
 		case roll < 0.10:
 			word = misspellWord(r, word)
 			kind = "misspelled"
 		case roll < 0.35:
-			word = prefixWord(r, word)
-			kind = "prefix"
+			if prefix, n, ok := loadtestPrefixWord(r, word, prefixMinLen, prefixMaxLen); ok {
+				word = prefix
+				prefixLen = n
+				kind = "prefix"
+			}
 		}
-		qs[i] = loadTestQuery{query: word, kind: kind, misspelled: kind == "misspelled", prefix: kind == "prefix", terms: 1}
+		qs[i] = loadTestQuery{query: word, kind: kind, misspelled: kind == "misspelled", prefix: kind == "prefix", prefixLen: prefixLen, terms: 1}
 	}
 	return qs
 }
 
-func buildLoadtestMultiQueries(r *rand.Rand, vocab []string, count int) []loadTestQuery {
+func buildLoadtestMultiQueries(r *rand.Rand, vocab []string, count, prefixMinLen, prefixMaxLen int) []loadTestQuery {
 	qs := make([]loadTestQuery, count)
 	for i := range qs {
 		nTerms := 2 + r.Intn(3)
@@ -395,6 +438,7 @@ func buildLoadtestMultiQueries(r *rand.Rand, vocab []string, count int) []loadTe
 		misspellIdx := -1
 		misspelled := false
 		prefix := false
+		prefixLen := 0
 		if r.Float64() < 0.10 {
 			misspellIdx = r.Intn(nTerms)
 		}
@@ -405,14 +449,34 @@ func buildLoadtestMultiQueries(r *rand.Rand, vocab []string, count int) []loadTe
 				w = misspellWord(r, w)
 				misspelled = true
 			case j == nTerms-1 && r.Float64() < 0.25:
-				w = prefixWord(r, w)
-				prefix = true
+				if pfx, n, ok := loadtestPrefixWord(r, w, prefixMinLen, prefixMaxLen); ok {
+					w = pfx
+					prefix = true
+					prefixLen = n
+				}
 			}
 			terms[j] = w
 		}
-		qs[i] = loadTestQuery{query: joinTerms(terms), misspelled: misspelled, prefix: prefix, terms: nTerms}
+		qs[i] = loadTestQuery{query: joinTerms(terms), misspelled: misspelled, prefix: prefix, prefixLen: prefixLen, terms: nTerms}
 	}
 	return qs
+}
+
+func loadtestPrefixWord(r *rand.Rand, word string, minLen, maxLen int) (string, int, bool) {
+	if len(word) <= 1 {
+		return word, 0, false
+	}
+	target := minLen
+	if maxLen > minLen {
+		target += r.Intn(maxLen - minLen + 1)
+	}
+	if target >= len(word) {
+		target = len(word) - 1
+	}
+	if target < 1 {
+		return word, 0, false
+	}
+	return word[:target], target, true
 }
 
 func ltSingleQuery(r *rand.Rand, vocab []string) string {

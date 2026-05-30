@@ -180,6 +180,8 @@ go run ./cmd/bench loadtest \
 | `-filter-pct` | `50` | Percentage of requests with a year filter in random mode |
 | `-multi-pct` | `50` | Percentage of multi-term queries in random mode |
 | `-mode-mix` | `random` | `random` uses `filter-pct`/`multi-pct`; `balanced` cycles evenly through the four benchmark modes |
+| `-prefix-min-len` | `1` | Minimum generated prefix length for prefix queries |
+| `-prefix-max-len` | `10` | Maximum generated prefix length for prefix queries |
 | `-timeout` | `10s` | Per-request HTTP timeout |
 | `-seed` | current time | RNG seed for reproducibility |
 | `-keepalive` | `true` | Use HTTP keep-alive |
@@ -212,6 +214,8 @@ Single-term queries:
 | Prefix | 25% |
 | Misspelled | 10% |
 
+Prefix queries use `-prefix-min-len` and `-prefix-max-len`; by default this creates 1-10 character prefixes, so short cases like `pe` are included in the load-test pool.
+
 Multi-term queries:
 
 | Behavior | Target Share |
@@ -241,5 +245,6 @@ When the run finishes it prints Markdown tables:
 | `Load test summary` | Overall and per-mode latency, status counts, errors, RPS, p50/p95/p99 |
 | `Load test configuration` | URL, index, vocab size, query pool size, workers, seed, timeout, runtime settings |
 | `Query generation details` | Exact/prefix/misspelled counts and multi-term distribution |
+| `Prefix length details` | Generated prefix length counts for single-term and multi-term prefix queries |
 
 If all requests return `404`, the load test did run, but it probably hit a service where the requested index was not created or loaded. Check `/list-indexes` first.

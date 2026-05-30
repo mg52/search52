@@ -24,7 +24,7 @@ func TestWeightedFieldsAffectRanking(t *testing.T) {
 	}
 	se.Index(docs)
 
-	res := mustSearchOneTerm(t, se, "apple", nil)
+	res := mustSingleTermSearchLoop(t, se, "apple", nil)
 	if len(res) != 2 {
 		t.Fatalf("expected 2 apple results, got %d: %+v", len(res), res)
 	}
@@ -46,7 +46,7 @@ func TestWeightedFieldsAffectRanking(t *testing.T) {
 	if loaded.FieldWeights["title"] != 5 || loaded.FieldWeights["description"] != 1 {
 		t.Fatalf("field weights not restored: %+v", loaded.FieldWeights)
 	}
-	res = mustSearchOneTerm(t, loaded, "apple", nil)
+	res = mustSingleTermSearchLoop(t, loaded, "apple", nil)
 	if len(res) != 2 || res[0].ID != "title-hit" || res[0].Score <= res[1].Score {
 		t.Fatalf("loaded weighted ranking mismatch: %+v", res)
 	}
@@ -118,7 +118,7 @@ func TestAddOrUpdateDocumentUsesFieldWeights(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument description-hit: %v", err)
 	}
 
-	res := mustSearchOneTerm(t, se, "apple", nil)
+	res := mustSingleTermSearchLoop(t, se, "apple", nil)
 	if len(res) != 2 {
 		t.Fatalf("expected 2 apple results, got %d: %+v", len(res), res)
 	}
@@ -150,7 +150,7 @@ func TestAddOrUpdateDocumentReindexesWeightedScores(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument stable-doc: %v", err)
 	}
 
-	res := mustSearchOneTerm(t, se, "apple", nil)
+	res := mustSingleTermSearchLoop(t, se, "apple", nil)
 	if len(res) != 2 || res[0].ID != "moving-doc" {
 		t.Fatalf("expected initially title-weighted moving-doc first, got %+v", res)
 	}
@@ -163,12 +163,12 @@ func TestAddOrUpdateDocumentReindexesWeightedScores(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument updated moving-doc: %v", err)
 	}
 
-	res = mustSearchOneTerm(t, se, "apple", nil)
+	res = mustSingleTermSearchLoop(t, se, "apple", nil)
 	if len(res) != 1 || res[0].ID != "stable-doc" {
 		t.Fatalf("expected old weighted apple posting to be tombstoned, got %+v", res)
 	}
 
-	res = mustSearchOneTerm(t, se, "banana", nil)
+	res = mustSingleTermSearchLoop(t, se, "banana", nil)
 	if len(res) != 1 || res[0].ID != "moving-doc" {
 		t.Fatalf("expected updated weighted banana posting, got %+v", res)
 	}
