@@ -1579,6 +1579,50 @@ func TestNumericYearFilterValuesAreIndexed(t *testing.T) {
 	}
 }
 
+func TestSaveLoadRebuildsArrayAndNumericFilters(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"name", "category", "description"},
+		map[string]bool{"category": true, "year": true},
+		10,
+	)
+
+	se.Index([]map[string]interface{}{
+		{
+			"id":          "p24",
+			"name":        "greenbackism hyrax ars venturers speiring dogsbodyings wems ringbarks",
+			"category":    []interface{}{"music", "yard", "party", "collectibles", "tea"},
+			"description": "papa caricature airlines peremptoriness storages",
+			"year":        2024,
+		},
+		{
+			"id":          "p25",
+			"name":        "ringbarks alternate",
+			"category":    []interface{}{"coffee"},
+			"description": "another product",
+			"year":        float64(2025),
+		},
+	})
+
+	dir := t.TempDir()
+	if err := se.SaveAll(dir); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+	loaded, err := LoadAll(dir)
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+
+	res := loaded.Search("ringbarks", map[string][]interface{}{"category": {"tea"}, "year": {"2024"}})
+	if len(res.Docs) != 1 || res.Docs[0].ID != "p24" {
+		t.Fatalf("expected p24 after load for category:tea year:2024, got %+v", res.Docs)
+	}
+
+	res = loaded.Search("ringbarks", map[string][]interface{}{"category": {"coffee"}, "year": {"2025"}})
+	if len(res.Docs) != 1 || res.Docs[0].ID != "p25" {
+		t.Fatalf("expected p25 after load for category:coffee year:2025, got %+v", res.Docs)
+	}
+}
+
 func TestIndexBatchingMatchesSingleBatch(t *testing.T) {
 	docs := make([]map[string]interface{}, 100)
 	for i := range docs {
