@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"testing"
 )
@@ -1574,5 +1576,70 @@ func TestNumericYearFilterValuesAreIndexed(t *testing.T) {
 	res = se.Search("ceramic", map[string][]interface{}{"year": {"2022"}})
 	if len(res.Docs) != 0 {
 		t.Fatalf("expected no docs for year:2022 filter, got %+v", res.Docs)
+	}
+}
+
+func TestIndexBatchingMatchesSingleBatch(t *testing.T) {
+	docs := make([]map[string]interface{}, 100)
+	for i := range docs {
+		docs[i] = map[string]interface{}{
+			"id":          fmt.Sprintf("p%03d", i+1),
+			"name":        fmt.Sprintf("product %03d shared term%d", i+1, i%7),
+			"category":    []interface{}{fmt.Sprintf("category-%02d", i%5), fmt.Sprintf("group-%02d", i%3)},
+			"description": fmt.Sprintf("description words batch term%d marker%d", i%11, i%13),
+			"year":        2020 + i%4,
+		}
+	}
+
+	oneShot := NewSearchEngine(
+		[]string{"name", "category", "description"},
+		map[string]bool{"category": true, "year": true},
+		25,
+	)
+	batched := NewSearchEngine(
+		[]string{"name", "category", "description"},
+		map[string]bool{"category": true, "year": true},
+		25,
+	)
+
+	oneShot.Index(docs)
+	batched.Index(docs[:33])
+	batched.Index(docs[33:66])
+	batched.Index(docs[66:])
+
+	assertEnginesEquivalent(t, oneShot, batched)
+}
+
+func assertEnginesEquivalent(t *testing.T, want, got *SearchEngine) {
+	t.Helper()
+
+	want.mu.RLock()
+	got.mu.RLock()
+	defer got.mu.RUnlock()
+	defer want.mu.RUnlock()
+
+	if !reflect.DeepEqual(want.DataMap, got.DataMap) {
+		t.Fatalf("DataMap mismatch")
+	}
+	if !reflect.DeepEqual(want.Prefix, got.Prefix) {
+		t.Fatalf("Prefix mismatch")
+	}
+	if !reflect.DeepEqual(want.FilterBits, got.FilterBits) {
+		t.Fatalf("FilterBits mismatch")
+	}
+	if !reflect.DeepEqual(want.Documents, got.Documents) {
+		t.Fatalf("Documents mismatch")
+	}
+	if !reflect.DeepEqual(want.DocDeleted, got.DocDeleted) {
+		t.Fatalf("DocDeleted mismatch")
+	}
+	if !reflect.DeepEqual(want.ExternalToInternal, got.ExternalToInternal) {
+		t.Fatalf("ExternalToInternal mismatch")
+	}
+	if !reflect.DeepEqual(want.InternalToExternal, got.InternalToExternal) {
+		t.Fatalf("InternalToExternal mismatch")
+	}
+	if want.nextInternalID != got.nextInternalID {
+		t.Fatalf("nextInternalID mismatch: got %d want %d", got.nextInternalID, want.nextInternalID)
 	}
 }
