@@ -76,13 +76,23 @@ Bench tooling documentation lives in [cmd/bench/README.md](cmd/bench/README.md)
 
 ## Quickstart
 
-### Build & Run
+### Run Locally
 
 ```bash
+export ADMINKEY='local-dev-key'
+export SEARCH52_INDEX_DATA_DIR='./data'
 go run ./cmd/service
 ```
 
 The API service listens on `:8080`. A small admin UI listens on `:8081`.
+
+Open the admin UI:
+
+```text
+http://localhost:8081
+```
+
+Enter the same `ADMINKEY` value in the UI header before creating indexes, writing documents, saving, loading, or compacting. Read-only actions such as listing indexes, search, and health checks do not require the key.
 
 ### Docker
 
@@ -93,6 +103,7 @@ docker run -d \
   -p 8080:8080 \
   -p 8081:8081 \
   -v search_data:/data \
+  -e ADMINKEY='change-me' \
   -e SEARCH52_INDEX_DATA_DIR=/data \
   --name searchengine \
   searchengine:latest
@@ -214,11 +225,28 @@ All endpoints return JSON and use HTTP status codes (`201 Created`, `200 OK`, `4
 
 Input validation is intentionally strict: index/filter/field names may contain only letters, numbers, `_`, `-`, and `.`; unknown JSON fields are rejected; `resultCount` must be between 1 and 10 000; search queries are capped at 512 characters; filter strings are capped at 2 048 characters; individual filter values are capped at 256 characters; JSON request bodies are capped at 1 MiB except single-document writes, which allow 5 MiB; bulk uploads allow up to 1 GiB.
 
+Mutating endpoints require an admin key. Set `ADMINKEY` in the service environment and send the same value with the `X-Admin-Key` header. Missing or wrong keys return `401 Unauthorized`.
+
+Protected endpoints:
+
+- `POST /create-index`
+- `POST /add-to-index`
+- `POST /document`
+- `DELETE /document`
+- `POST /save-controller`
+- `POST /load-controller`
+- `POST /compact-index`
+
+Read-only endpoints (`/list-indexes`, `/search`, `/health`) do not require the key.
+
+The admin UI port exposes the same API under `/api/...`, for example `/api/create-index` and `/api/search`.
+
 ### 1. Create Index
 
 ```bash
 curl -X POST http://localhost:8080/create-index \
   -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: local-dev-key' \
   -d '{
     "indexName":   "products",
     "indexFields": ["name", "tags"],
@@ -259,6 +287,7 @@ The response includes every in-memory index and its current active document coun
 
 ```bash
 curl -X POST 'http://localhost:8080/add-to-index?indexName=products' \
+  -H 'X-Admin-Key: local-dev-key' \
   -F 'file=@docs.json'
 ```
 
@@ -307,6 +336,7 @@ Search requests use a 10 second context timeout. If a query exceeds that budget,
 ```bash
 curl -X POST 'http://localhost:8080/document?indexName=products' \
   -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: local-dev-key' \
   -d '{
     "document": { "id": "14", "name": "New Name", "tags": ["x"], "year": "2021" }
   }'
@@ -317,7 +347,8 @@ curl -X POST 'http://localhost:8080/document?indexName=products' \
 ### 6. Delete Single Document
 
 ```bash
-curl -X DELETE 'http://localhost:8080/document?indexName=products&id=14'
+curl -X DELETE 'http://localhost:8080/document?indexName=products&id=14' \
+  -H 'X-Admin-Key: local-dev-key'
 ```
 
 ### 7. Save Index
@@ -325,6 +356,7 @@ curl -X DELETE 'http://localhost:8080/document?indexName=products&id=14'
 ```bash
 curl -X POST http://localhost:8080/save-controller \
   -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: local-dev-key' \
   -d '{ "indexName": "products" }'
 ```
 
@@ -335,6 +367,7 @@ Indexes are saved under `$SEARCH52_INDEX_DATA_DIR/<indexName>/engine.gob`; if `S
 ```bash
 curl -X POST http://localhost:8080/load-controller \
   -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: local-dev-key' \
   -d '{ "indexName": "products" }'
 ```
 
@@ -345,6 +378,7 @@ Load is rollback-safe: a corrupt or invalid `engine.gob` does not replace an alr
 ```bash
 curl -X POST http://localhost:8080/compact-index \
   -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: local-dev-key' \
   -d '{ "indexName": "products" }'
 ```
 
@@ -381,6 +415,8 @@ The admin UI runs on a separate port and shares the same in-memory engine instan
 - compact an index to remove tombstoned versions
 
 The UI port can be changed with `SEARCH52_ADMIN_ADDR`; the API port can be changed with `SEARCH52_API_ADDR`.
+
+Mutating UI actions require the same `ADMINKEY` used by the server. Enter it in the password field in the UI header; the browser stores it in local storage and sends it as `X-Admin-Key` for protected requests.
 
 ---
 

@@ -37,3 +37,5 @@ go.work.sum
 *.out
 *.bz2
 *.py
+
+*.toml

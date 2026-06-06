@@ -12,8 +12,9 @@ WORKDIR /app
 COPY go.mod ./
 RUN go mod download
 
-# Copy source and build statically
-COPY . .
+# Copy service source and build statically
+COPY cmd ./cmd
+COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" -o /searchengine ./cmd/service
 
@@ -32,6 +33,9 @@ COPY --from=builder /searchengine /usr/local/bin/searchengine
 
 # Switch to non-root
 USER appuser
+
+# Persist indexes in the mounted data volume by default
+ENV SEARCH52_INDEX_DATA_DIR=/data
 
 # Expose the API and admin UI ports
 EXPOSE 8080 8081

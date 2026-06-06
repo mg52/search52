@@ -297,22 +297,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 			se.indexTokenLocked(token, internalID, score)
 		}
 
-		for field := range se.Filters {
-			val, ok := doc[field]
-			if !ok {
-				continue
-			}
-			var filterKey string
-			switch val.(type) {
-			case int, int8, int16, int32, int64, float32, float64:
-				filterKey = fmt.Sprintf("%s:%v", field, val)
-			case string:
-				filterKey = fmt.Sprintf("%s:%s", field, val)
-			default:
-				continue
-			}
-			se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internalID)
-		}
+		se.setFilterBitsLocked(doc, internalID, se.Filters)
 		se.mu.Unlock()
 	}
 
@@ -437,6 +422,10 @@ func (se *SearchEngine) indexTokenLocked(term string, id uint32, score int) {
 // UpdatePrefix rebuilds the prefix lookup from currently-active postings and
 // orders each prefix list by active document frequency descending.
 func (se *SearchEngine) UpdatePrefix() {
+	if SkipUpdatePrefix {
+		slog.Info("SkipUpdatePrefix is true, skipping")
+		return
+	}
 	se.mu.Lock()
 	defer se.mu.Unlock()
 
@@ -523,22 +512,7 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 			for token, score := range localScores {
 				se.indexTokenLocked(token, internal, score)
 			}
-			for field := range filters {
-				value, exists := doc[field]
-				if !exists {
-					continue
-				}
-				var filterKey string
-				switch value.(type) {
-				case int, int8, int16, int32, int64, float32, float64:
-					filterKey = fmt.Sprintf("%s:%v", field, value)
-				case string:
-					filterKey = fmt.Sprintf("%s:%s", field, value)
-				default:
-					continue
-				}
-				se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internal)
-			}
+			se.setFilterBitsLocked(doc, internal, filters)
 		}
 		se.mu.Unlock()
 	}
@@ -601,22 +575,7 @@ func (se *SearchEngine) CompactDeleted() CompactStats {
 		for token, score := range weightedTokenScores(item.doc, indexFields, fieldWeights) {
 			se.indexTokenLocked(token, internalID, score)
 		}
-		for field := range filters {
-			value, exists := item.doc[field]
-			if !exists {
-				continue
-			}
-			var filterKey string
-			switch value.(type) {
-			case int, int8, int16, int32, int64, float32, float64:
-				filterKey = fmt.Sprintf("%s:%v", field, value)
-			case string:
-				filterKey = fmt.Sprintf("%s:%s", field, value)
-			default:
-				continue
-			}
-			se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internalID)
-		}
+		se.setFilterBitsLocked(item.doc, internalID, filters)
 	}
 	se.updatePrefixLocked()
 
@@ -639,6 +598,46 @@ func (se *SearchEngine) activeDocumentCountLocked() int {
 		}
 	}
 	return active
+}
+
+func (se *SearchEngine) setFilterBitsLocked(doc map[string]interface{}, internalID uint32, filters map[string]bool) {
+	for field := range filters {
+		value, exists := doc[field]
+		if !exists {
+			continue
+		}
+		for _, key := range filterKeys(field, value) {
+			se.FilterBits[key] = filterBitSet(se.FilterBits[key], internalID)
+		}
+	}
+}
+
+func filterKeys(field string, value interface{}) []string {
+	switch v := value.(type) {
+	case int, int8, int16, int32, int64, float32, float64:
+		return []string{fmt.Sprintf("%s:%v", field, v)}
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []string{fmt.Sprintf("%s:%s", field, v)}
+	case []string:
+		keys := make([]string, 0, len(v))
+		for _, item := range v {
+			if item != "" {
+				keys = append(keys, fmt.Sprintf("%s:%s", field, item))
+			}
+		}
+		return keys
+	case []interface{}:
+		keys := make([]string, 0, len(v))
+		for _, item := range v {
+			keys = append(keys, filterKeys(field, item)...)
+		}
+		return keys
+	default:
+		return nil
+	}
 }
 
 func copyDocument(doc map[string]interface{}) map[string]interface{} {
@@ -1179,22 +1178,7 @@ func (se *SearchEngine) AddOrUpdateDocument(doc map[string]interface{}) error {
 		se.indexTokenLocked(token, internal, score)
 	}
 
-	for field := range filters {
-		value, exists := doc[field]
-		if !exists {
-			continue
-		}
-		var filterKey string
-		switch value.(type) {
-		case int, int8, int16, int32, int64, float32, float64:
-			filterKey = fmt.Sprintf("%s:%v", field, value)
-		case string:
-			filterKey = fmt.Sprintf("%s:%s", field, value)
-		default:
-			continue
-		}
-		se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internal)
-	}
+	se.setFilterBitsLocked(doc, internal, filters)
 
 	se.mu.Unlock()
 

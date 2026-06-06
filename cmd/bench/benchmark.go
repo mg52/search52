@@ -25,6 +25,8 @@ func runBenchmark(args []string) {
 	resultSize := fs.Int("result-size", 100, "Engine result size (top-k)")
 	warmup := fs.Int("warmup", 500, "Warmup iterations before measuring")
 	seed := fs.Int64("seed", 99, "Random seed for query generation")
+	fields := fs.String("fields", "title,tags", "Comma-separated fields to index")
+	filterField := fs.String("filter", "year", "Filter field")
 	_ = fs.Parse(args)
 
 	vocab, err := loadVocabFile(*vocabFile)
@@ -42,10 +44,16 @@ func runBenchmark(args []string) {
 	}
 	fmt.Printf("Loaded %d documents\n", len(docs))
 
-	fmt.Printf("Building engine (fields: title+tags, filter: year, result-size: %d)...\n", *resultSize)
+	indexFields := splitCSV(*fields)
+	filters := map[string]bool{}
+	if *filterField != "" {
+		filters[*filterField] = true
+	}
+
+	fmt.Printf("Building engine (fields: %s, filter: %s, result-size: %d)...\n", strings.Join(indexFields, "+"), *filterField, *resultSize)
 	se := engine.NewSearchEngine(
-		[]string{"title", "tags"},
-		map[string]bool{"year": true},
+		indexFields,
+		filters,
 		*resultSize,
 	)
 

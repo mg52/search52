@@ -32,6 +32,7 @@
     pre { margin: 0; white-space: pre-wrap; overflow: auto; max-height: 420px; background: #101522; color: #d7e0f4; padding: 14px; border-radius: 8px; font-size: 12px; }
     .status { font-size: 13px; color: #525a67; }
     .toolbar { display: flex; gap: 10px; align-items: center; }
+    .key-input { width: 220px; }
     @media (max-width: 900px) { header { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
@@ -39,6 +40,7 @@
   <header>
     <h1>Search52 Admin</h1>
     <div class="toolbar">
+      <input id="adminKey" class="key-input" type="password" placeholder="ADMINKEY" autocomplete="current-password" oninput="saveAdminKey()">
       <span id="status" class="status">Ready</span>
       <button class="secondary" onclick="refreshIndexes()">Refresh</button>
     </div>
@@ -124,6 +126,8 @@
   <script>
     const out = document.getElementById('output');
     const statusEl = document.getElementById('status');
+    const adminKeyEl = document.getElementById('adminKey');
+    adminKeyEl.value = localStorage.getItem('search52AdminKey') || '';
     function openTab(name) {
       document.querySelectorAll('.tab-panel').forEach(el => el.classList.toggle('active', el.id === 'tab-' + name));
       document.querySelectorAll('.tab-button').forEach(el => el.classList.toggle('active', el.dataset.tab === name));
@@ -131,6 +135,10 @@
     function setStatus(text) { statusEl.textContent = text; }
     function show(data) { out.textContent = JSON.stringify(data, null, 2); }
     function csv(id) { return document.getElementById(id).value.split(',').map(v => v.trim()).filter(Boolean); }
+    function saveAdminKey() { localStorage.setItem('search52AdminKey', adminKeyEl.value); }
+    function adminHeaders(headers = {}) {
+      return Object.assign({}, headers, {'X-Admin-Key': adminKeyEl.value});
+    }
     async function request(path, options) {
       setStatus('Working...');
       try {
@@ -180,7 +188,7 @@
       if (raw) weights = JSON.parse(raw);
       await request('/api/create-index', {
         method: 'POST',
-        headers: {'Content-Type':'application/json'},
+        headers: adminHeaders({'Content-Type':'application/json'}),
         body: JSON.stringify({
           indexName: document.getElementById('createName').value.trim(),
           indexFields: csv('createFields'),
@@ -195,7 +203,7 @@
       const documentBody = JSON.parse(document.getElementById('docBody').value);
       await request('/api/document?indexName=' + encodeURIComponent(indexName), {
         method: 'POST',
-        headers: {'Content-Type':'application/json'},
+        headers: adminHeaders({'Content-Type':'application/json'}),
         body: JSON.stringify({ document: documentBody })
       });
     }
@@ -205,7 +213,7 @@
       const params = new URLSearchParams();
       params.set('indexName', indexName);
       params.set('id', id);
-      await request('/api/document?' + params.toString(), { method: 'DELETE' });
+      await request('/api/document?' + params.toString(), { method: 'DELETE', headers: adminHeaders() });
     }
     async function search() {
       const params = new URLSearchParams();
@@ -218,21 +226,21 @@
     async function saveIndex() {
       await request('/api/save-controller', {
         method: 'POST',
-        headers: {'Content-Type':'application/json'},
+        headers: adminHeaders({'Content-Type':'application/json'}),
         body: JSON.stringify({ indexName: document.getElementById('saveIndex').value.trim() })
       });
     }
     async function loadIndex() {
       await request('/api/load-controller', {
         method: 'POST',
-        headers: {'Content-Type':'application/json'},
+        headers: adminHeaders({'Content-Type':'application/json'}),
         body: JSON.stringify({ indexName: document.getElementById('loadIndex').value.trim() })
       });
     }
     async function compactIndex() {
       await request('/api/compact-index', {
         method: 'POST',
-        headers: {'Content-Type':'application/json'},
+        headers: adminHeaders({'Content-Type':'application/json'}),
         body: JSON.stringify({ indexName: document.getElementById('compactIndex').value.trim() })
       });
       await refreshIndexes(false);

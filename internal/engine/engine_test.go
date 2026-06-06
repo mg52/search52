@@ -1336,6 +1336,10 @@ func TestCompactDeleted_RebuildsCurrentIndexOnly(t *testing.T) {
 }
 
 func TestUpdatePrefixOrdersByActiveDocFrequencyAndDropsDeletedTerms(t *testing.T) {
+	if SkipUpdatePrefix {
+		t.Skip("UpdatePrefix ordering is disabled by SkipUpdatePrefix")
+	}
+
 	se := NewSearchEngine([]string{"title"}, nil, 10)
 
 	docs := []map[string]interface{}{
@@ -1383,6 +1387,10 @@ func TestUpdatePrefixOrdersByActiveDocFrequencyAndDropsDeletedTerms(t *testing.T
 }
 
 func TestUpdatePrefixOrdersByActiveDocFrequencyAndDropsDeletedTerms2(t *testing.T) {
+	if SkipUpdatePrefix {
+		t.Skip("UpdatePrefix ordering is disabled by SkipUpdatePrefix")
+	}
+
 	se := NewSearchEngine([]string{"title"}, nil, 10)
 
 	docs := []map[string]interface{}{
@@ -1480,5 +1488,91 @@ func TestFilterFieldsReturnsCopy(t *testing.T) {
 	}
 	if filters["category"] {
 		t.Fatalf("expected external mutation not to add category, got %+v", filters)
+	}
+}
+
+func TestArrayFilterValuesAreIndexed(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"name", "category", "description"},
+		map[string]bool{"category": true},
+		10,
+	)
+
+	se.Index([]map[string]interface{}{
+		{
+			"id":          "p24",
+			"name":        "greenbackism hyrax ars venturers speiring dogsbodyings wems ringbarks",
+			"category":    []interface{}{"music", "yard", "party", "collectibles", "tea"},
+			"description": "papa caricature airlines peremptoriness storages",
+		},
+		{
+			"id":          "p25",
+			"name":        "ringbarks alternate",
+			"category":    []interface{}{"coffee"},
+			"description": "another product",
+		},
+	})
+
+	res := se.Search("ringbarks", map[string][]interface{}{"category": {"tea"}})
+	if len(res.Docs) == 0 || res.Docs[0].ID != "p24" {
+		t.Fatalf("expected p24 for category:tea filter, got %+v", res.Docs)
+	}
+
+	res = se.Search("ringbarks", map[string][]interface{}{"category": {"coffee"}})
+	if len(res.Docs) == 0 || res.Docs[0].ID != "p25" {
+		t.Fatalf("expected p25 for category:coffee filter, got %+v", res.Docs)
+	}
+}
+
+func TestNumericYearFilterValuesAreIndexed(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"title", "description"},
+		map[string]bool{"year": true},
+		10,
+	)
+
+	se.Index([]map[string]interface{}{
+		{
+			"id":          "int-year",
+			"title":       "ceramic travel mug",
+			"description": "insulated cup for morning tea",
+			"year":        2024,
+		},
+		{
+			"id":          "float-year",
+			"title":       "ceramic desk lamp",
+			"description": "warm light for evening reading",
+			"year":        float64(2025),
+		},
+		{
+			"id":          "other-year",
+			"title":       "ceramic garden pot",
+			"description": "large planter for flowers",
+			"year":        2023,
+		},
+	})
+
+	res := se.Search("ceramic", map[string][]interface{}{"year": {"2024"}})
+	if len(res.Docs) != 1 || res.Docs[0].ID != "int-year" {
+		t.Fatalf("expected int-year for year:2024 filter, got %+v", res.Docs)
+	}
+
+	res = se.Search("ceramic", map[string][]interface{}{"year": {"2025"}})
+	if len(res.Docs) != 1 || res.Docs[0].ID != "float-year" {
+		t.Fatalf("expected float-year for year:2025 filter, got %+v", res.Docs)
+	}
+
+	res = se.Search("ceramic", map[string][]interface{}{"year": {"2024", "2025"}})
+	if len(res.Docs) != 2 {
+		t.Fatalf("expected two docs for year:2024 OR year:2025 filter, got %+v", res.Docs)
+	}
+	got := map[string]bool{res.Docs[0].ID: true, res.Docs[1].ID: true}
+	if !got["int-year"] || !got["float-year"] {
+		t.Fatalf("expected int-year and float-year, got %+v", res.Docs)
+	}
+
+	res = se.Search("ceramic", map[string][]interface{}{"year": {"2022"}})
+	if len(res.Docs) != 0 {
+		t.Fatalf("expected no docs for year:2022 filter, got %+v", res.Docs)
 	}
 }

@@ -126,6 +126,7 @@ go run ./cmd/bench vocab \
 Start the HTTP service:
 
 ```bash
+export ADMINKEY='bench-key'
 go run ./cmd/service
 ```
 
@@ -134,6 +135,7 @@ Create the index:
 ```bash
 curl -X POST http://127.0.0.1:8080/create-index \
   -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: bench-key' \
   -d '{
     "indexName":"mb5m",
     "indexFields":["title","artist","album"],
@@ -146,6 +148,7 @@ Upload the JSON file:
 
 ```bash
 curl -X POST 'http://127.0.0.1:8080/add-to-index?indexName=mb5m' \
+  -H 'X-Admin-Key: bench-key' \
   -F 'file=@mb_5m.json'
 ```
 

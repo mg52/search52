@@ -1,0 +1,9 @@
+# Keep Docker builds focused on the Go service source.
+*
+
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**

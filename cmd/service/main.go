@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"errors"
 	"log"
@@ -64,30 +65,45 @@ func main() {
 
 func newAPIMux(ht *handler.HTTP) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/create-index", ht.CreateIndex)
+	mux.HandleFunc("/create-index", requireAdminKey(ht.CreateIndex))
 	mux.HandleFunc("/search", ht.Search)
-	mux.HandleFunc("/add-to-index", ht.AddToIndex)
+	mux.HandleFunc("/add-to-index", requireAdminKey(ht.AddToIndex))
 	mux.HandleFunc("/list-indexes", ht.ListIndexes)
-	mux.HandleFunc("/save-controller", ht.SaveEngine)
-	mux.HandleFunc("/load-controller", ht.LoadEngine)
-	mux.HandleFunc("/compact-index", ht.CompactIndex)
+	mux.HandleFunc("/save-controller", requireAdminKey(ht.SaveEngine))
+	mux.HandleFunc("/load-controller", requireAdminKey(ht.LoadEngine))
+	mux.HandleFunc("/compact-index", requireAdminKey(ht.CompactIndex))
 	mux.HandleFunc("/health", ht.Health)
-	mux.HandleFunc("/document", documentHandler(ht))
+	mux.HandleFunc("/document", requireAdminKey(documentHandler(ht)))
 	return mux
 }
 
 func newAdminMux(ht *handler.HTTP) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", adminPage)
-	mux.HandleFunc("/api/create-index", ht.CreateIndex)
+	mux.HandleFunc("/api/create-index", requireAdminKey(ht.CreateIndex))
 	mux.HandleFunc("/api/search", ht.Search)
-	mux.HandleFunc("/api/add-to-index", ht.AddToIndex)
+	mux.HandleFunc("/api/add-to-index", requireAdminKey(ht.AddToIndex))
 	mux.HandleFunc("/api/list-indexes", ht.ListIndexes)
-	mux.HandleFunc("/api/save-controller", ht.SaveEngine)
-	mux.HandleFunc("/api/load-controller", ht.LoadEngine)
-	mux.HandleFunc("/api/compact-index", ht.CompactIndex)
-	mux.HandleFunc("/api/document", documentHandler(ht))
+	mux.HandleFunc("/api/save-controller", requireAdminKey(ht.SaveEngine))
+	mux.HandleFunc("/api/load-controller", requireAdminKey(ht.LoadEngine))
+	mux.HandleFunc("/api/compact-index", requireAdminKey(ht.CompactIndex))
+	mux.HandleFunc("/api/health", ht.Health)
+	mux.HandleFunc("/api/document", requireAdminKey(documentHandler(ht)))
 	return mux
+}
+
+func requireAdminKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		expected := os.Getenv("ADMINKEY")
+		actual := r.Header.Get("X-Admin-Key")
+		if expected == "" || actual == "" || subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"status":"error","statusCode":401,"error":"unauthorized"}`))
+			return
+		}
+		next(w, r)
+	}
 }
 
 func documentHandler(ht *handler.HTTP) http.HandlerFunc {
