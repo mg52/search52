@@ -698,8 +698,9 @@ func (se *SearchEngine) SingleTermSearchLoop(ctx context.Context, query string, 
 		}
 
 		if len(h) < k {
+			// TODO: term based boost can be added here. example: if category:outdoor -> increase score
 			h = heapPushHit(h, internalHit{id: id, score: score})
-			if len(h) >= k && SkipWholeScan {
+			if SkipWholeScan && len(h) >= k {
 				goto BreakLoop
 			}
 		} else if h[0].score < score {
@@ -860,8 +861,9 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 			}
 
 			if len(h) < k {
+				// TODO: term based boost can be added here. example: if category:outdoor -> increase score
 				h = heapPushHit(h, internalHit{id: internalID, score: total})
-				if len(h) >= k && SkipWholeScan {
+				if SkipWholeScan && len(h) >= k {
 					goto BreakLoop
 				}
 			} else if h[0].score < total {
@@ -1014,6 +1016,7 @@ func (se *SearchEngine) Search(query string, filters map[string][]interface{}) *
 }
 
 func (se *SearchEngine) SearchContext(ctx context.Context, query string, filters map[string][]interface{}) (*SearchResult, error) {
+	// TODO: Send raw query into search functions to be able to boost exact match more.
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil, nil

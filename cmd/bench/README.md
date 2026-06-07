@@ -139,6 +139,11 @@ curl -X POST http://127.0.0.1:8080/create-index \
   -d '{
     "indexName":"mb5m",
     "indexFields":["title","artist","album"],
+    "fieldWeights": {
+      "artist": 2,
+      "album": 1,
+      "title": 2
+    },
     "filters":["year"],
     "resultCount":100
   }'

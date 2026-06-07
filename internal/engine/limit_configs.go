@@ -2,7 +2,7 @@ package engine
 
 const MaxPrefixTerms = 5_000
 const SkipWholeScan = false
-const SkipUpdatePrefix = true
+const SkipUpdatePrefix = false
 
 func prefixLimitForQuery(prefix string) int {
 	switch {
