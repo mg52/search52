@@ -167,13 +167,11 @@ Run the load test:
 
 ```bash
 go run ./cmd/bench loadtest \
-  -url http://127.0.0.1:8080/search \
-  -vocab mb_vocab.txt \
-  -index mb5m \
-  -requests 100000 \
-  -workers 16 \
-  -seed 99 \
-  -mode-mix balanced
+    -url http://127.0.0.1:8080/search \
+    -index mb5m \
+    -vocab mb_vocab.txt \
+    -docs mb_5m.json \
+    -requests 100000 -workers 16 -seed 99 -mode-mix balanced
 ```
 
 ### Loadtest Flags

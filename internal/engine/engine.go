@@ -11,9 +11,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mg52/search52/internal/symspell"
 )
@@ -98,8 +101,9 @@ type SearchEngine struct {
 	ResultSize   int
 
 	// termSet is a lock-free set of all indexed terms, used for O(1) existence
-	// checks in the search path without touching se.mu.
-	termSet sync.Map
+	// checks in the search path without touching se.mu. Stored as an atomic
+	// pointer so CompactDeleted can swap the entire map without a data race.
+	termSet atomic.Pointer[sync.Map]
 
 	mu sync.RWMutex
 }
@@ -112,7 +116,7 @@ func NewSearchEngine(indexFields []string, filters map[string]bool, resultSize i
 // NewSearchEngineWithFieldWeights constructs a new engine with per-index-field
 // scoring weights. Missing or non-positive weights default to 1.
 func NewSearchEngineWithFieldWeights(indexFields []string, fieldWeights map[string]int, filters map[string]bool, resultSize int) *SearchEngine {
-	return &SearchEngine{
+	se := &SearchEngine{
 		DataMap:            make(map[string]map[uint32]int),
 		DocDeleted:         make(map[uint32]bool),
 		ExternalToInternal: make(map[string]uint32),
@@ -127,6 +131,8 @@ func NewSearchEngineWithFieldWeights(indexFields []string, fieldWeights map[stri
 		FilterBits:         make(map[string][]uint64),
 		ResultSize:         resultSize,
 	}
+	se.termSet.Store(new(sync.Map))
+	return se
 }
 
 func (se *SearchEngine) Stats() IndexStats {
@@ -255,6 +261,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 		Filters:            make(map[string]bool),
 		ResultSize:         100,
 	}
+	se.termSet.Store(new(sync.Map))
 
 	// Restore docs + metadata
 	se.Documents = payload.Documents
@@ -419,12 +426,15 @@ func (se *SearchEngine) InsertDocs(docs []map[string]interface{}) {
 func (se *SearchEngine) indexTokenLocked(term string, id uint32, score int) {
 	docMap, termExists := se.DataMap[term]
 	if !termExists {
-		se.termSet.Store(term, struct{}{})
+		se.termSet.Load().Store(term, struct{}{})
 		// TODO: make it var in the engine definition
-		if len(term) >= 4 {
+		if utf8.RuneCountInString(term) >= 4 {
 			se.Symspell.AddWord(term)
 		}
-		for i := 1; i < len(term); i++ {
+		for i := range term {
+			if i == 0 {
+				continue
+			}
 			pfx := term[:i]
 			if len(se.Prefix[pfx]) < MaxPrefixTerms {
 				se.Prefix[pfx] = append(se.Prefix[pfx], term)
@@ -438,24 +448,21 @@ func (se *SearchEngine) indexTokenLocked(term string, id uint32, score int) {
 
 // UpdatePrefix rebuilds the prefix lookup from currently-active postings and
 // orders each prefix list by active document frequency descending.
+// It holds the write lock only for the final pointer swap, so searches are
+// blocked for nanoseconds rather than the full rebuild duration.
 func (se *SearchEngine) UpdatePrefix() {
 	if SkipUpdatePrefix {
 		slog.Info("SkipUpdatePrefix is true, skipping")
 		return
 	}
-	se.mu.Lock()
-	defer se.mu.Unlock()
 
-	se.updatePrefixLocked()
-}
-
-// updatePrefixLocked rebuilds Prefix from DataMap. Caller must hold se.mu.Lock().
-func (se *SearchEngine) updatePrefixLocked() {
 	type termFreq struct {
 		term string
 		freq int
 	}
 
+	// Step A: snapshot term→freq counts under read lock.
+	se.mu.RLock()
 	terms := make([]termFreq, 0, len(se.DataMap))
 	for term, postings := range se.DataMap {
 		freq := 0
@@ -468,7 +475,9 @@ func (se *SearchEngine) updatePrefixLocked() {
 			terms = append(terms, termFreq{term: term, freq: freq})
 		}
 	}
+	se.mu.RUnlock()
 
+	// Step B: sort and build the new prefix map with no lock held.
 	sort.Slice(terms, func(i, j int) bool {
 		if terms[i].freq != terms[j].freq {
 			return terms[i].freq > terms[j].freq
@@ -478,14 +487,21 @@ func (se *SearchEngine) updatePrefixLocked() {
 
 	prefix := make(map[string][]string)
 	for _, tf := range terms {
-		for i := 1; i < len(tf.term); i++ {
+		for i := range tf.term {
+			if i == 0 {
+				continue
+			}
 			pfx := tf.term[:i]
 			if len(prefix[pfx]) < MaxPrefixTerms {
 				prefix[pfx] = append(prefix[pfx], tf.term)
 			}
 		}
 	}
+
+	// Step C: swap under write lock — single pointer assignment.
+	se.mu.Lock()
 	se.Prefix = prefix
+	se.mu.Unlock()
 }
 
 // BuildDocumentIndex tokenizes index fields and updates the inverted index and filters.
@@ -538,18 +554,24 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 // CompactDeleted rebuilds every derived structure and drops tombstoned old
 // document versions. Active external IDs are preserved, while internal IDs are
 // reassigned densely from 1.
+//
+// Locking strategy: hold RLock only during the initial snapshot, do all heavy
+// CPU work with no lock, then swap every pointer under a brief write lock so
+// searches block for nanoseconds rather than the full rebuild duration.
 func (se *SearchEngine) CompactDeleted() CompactStats {
-	se.mu.Lock()
-	defer se.mu.Unlock()
-
+	// Step A: snapshot active documents and config under read lock.
+	se.mu.RLock()
 	beforeStored := len(se.Documents)
-	beforeActive := se.activeDocumentCountLocked()
+	indexFields := append([]string(nil), se.IndexFields...)
+	fieldWeights := copyIntMap(se.FieldWeights)
+	filters := copyBoolMap(se.Filters)
+	oldDataMapLen := len(se.DataMap)
 
 	type activeDoc struct {
 		externalID string
 		doc        map[string]interface{}
 	}
-	active := make([]activeDoc, 0, beforeActive)
+	active := make([]activeDoc, 0, len(se.ExternalToInternal))
 	for externalID, internalID := range se.ExternalToInternal {
 		if se.DocDeleted[internalID] {
 			continue
@@ -563,58 +585,129 @@ func (se *SearchEngine) CompactDeleted() CompactStats {
 			doc:        copyDocument(doc),
 		})
 	}
+	se.mu.RUnlock()
+
+	beforeActive := len(active)
+
+	// Step B: rebuild all structures locally with no lock held.
+
+	// Deterministic internal-ID assignment (same order every compact).
 	sort.Slice(active, func(i, j int) bool {
 		return active[i].externalID < active[j].externalID
 	})
 
-	indexFields := append([]string(nil), se.IndexFields...)
-	fieldWeights := copyIntMap(se.FieldWeights)
-	filters := copyBoolMap(se.Filters)
-
-	se.DataMap = make(map[string]map[uint32]int)
-	se.DocDeleted = make(map[uint32]bool)
-	se.ExternalToInternal = make(map[string]uint32)
-	se.InternalToExternal = make(map[uint32]string)
-	se.nextInternalID = 1
-	se.Documents = make(map[uint32]map[string]interface{}, len(active))
-	se.FilterBits = make(map[string][]uint64)
-	se.Prefix = make(map[string][]string)
-	se.Symspell = symspell.NewSymSpell()
-	se.termSet = sync.Map{}
-
-	for _, item := range active {
-		internalID := se.nextInternalID
-		se.nextInternalID++
-		se.ExternalToInternal[item.externalID] = internalID
-		se.InternalToExternal[internalID] = item.externalID
-		se.Documents[internalID] = item.doc
-
-		for token, score := range weightedTokenScores(item.doc, indexFields, fieldWeights) {
-			se.indexTokenLocked(token, internalID, score)
-		}
-		se.setFilterBitsLocked(item.doc, internalID, filters)
+	// Parallel tokenization — weightedTokenScores is pure CPU, no shared state.
+	tokenResults := make([]map[string]int, len(active))
+	numWorkers := runtime.NumCPU()
+	workCh := make(chan int, numWorkers*4)
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range workCh {
+				tokenResults[i] = weightedTokenScores(active[i].doc, indexFields, fieldWeights)
+			}
+		}()
 	}
-	se.updatePrefixLocked()
+	for i := range active {
+		workCh <- i
+	}
+	close(workCh)
+	wg.Wait()
 
-	afterStored := len(se.Documents)
-	afterActive := se.activeDocumentCountLocked()
+	// Sequential write into fresh local structures (no lock — all local).
+	newDataMap := make(map[string]map[uint32]int, oldDataMapLen)
+	newExtToInt := make(map[string]uint32, len(active))
+	newIntToExt := make(map[uint32]string, len(active))
+	newDocuments := make(map[uint32]map[string]interface{}, len(active))
+	newFilterBits := make(map[string][]uint64)
+	newSymspell := symspell.NewSymSpell()
+	newTermSet := new(sync.Map)
+
+	var nextID uint32 = 1
+	for i, item := range active {
+		id := nextID
+		nextID++
+		newExtToInt[item.externalID] = id
+		newIntToExt[id] = item.externalID
+		newDocuments[id] = item.doc
+
+		for token, score := range tokenResults[i] {
+			docMap, exists := newDataMap[token]
+			if !exists {
+				newTermSet.Store(token, struct{}{})
+				if utf8.RuneCountInString(token) >= 4 {
+					newSymspell.AddWord(token)
+				}
+				docMap = make(map[uint32]int)
+				newDataMap[token] = docMap
+			}
+			docMap[id] += score
+		}
+
+		for field := range filters {
+			value, exists := item.doc[field]
+			if !exists {
+				continue
+			}
+			for _, key := range filterKeys(field, value) {
+				newFilterBits[key] = filterBitSet(newFilterBits[key], id)
+			}
+		}
+	}
+
+	// Build prefix map in one sorted pass. All entries in newDataMap are active
+	// (no tombstones), so len(postings) is the exact doc frequency.
+	type termFreq struct {
+		term string
+		freq int
+	}
+	tfs := make([]termFreq, 0, len(newDataMap))
+	for term, postings := range newDataMap {
+		tfs = append(tfs, termFreq{term, len(postings)})
+	}
+	sort.Slice(tfs, func(i, j int) bool {
+		if tfs[i].freq != tfs[j].freq {
+			return tfs[i].freq > tfs[j].freq
+		}
+		return tfs[i].term < tfs[j].term
+	})
+	newPrefix := make(map[string][]string)
+	for _, tf := range tfs {
+		for i := range tf.term {
+			if i == 0 {
+				continue
+			}
+			pfx := tf.term[:i]
+			if len(newPrefix[pfx]) < MaxPrefixTerms {
+				newPrefix[pfx] = append(newPrefix[pfx], tf.term)
+			}
+		}
+	}
+
+	// Step C: atomic swap under write lock — only pointer assignments, no CPU work.
+	// termSet uses atomic.Pointer so searches never see a torn value.
+	se.mu.Lock()
+	se.DataMap = newDataMap
+	se.DocDeleted = make(map[uint32]bool)
+	se.ExternalToInternal = newExtToInt
+	se.InternalToExternal = newIntToExt
+	se.nextInternalID = nextID
+	se.Documents = newDocuments
+	se.FilterBits = newFilterBits
+	se.Prefix = newPrefix
+	se.Symspell = newSymspell
+	se.termSet.Store(newTermSet)
+	se.mu.Unlock()
+
 	return CompactStats{
 		BeforeStored:    beforeStored,
 		BeforeActive:    beforeActive,
-		AfterStored:     afterStored,
-		AfterActive:     afterActive,
-		RemovedVersions: beforeStored - afterStored,
+		AfterStored:     len(newDocuments),
+		AfterActive:     len(active),
+		RemovedVersions: beforeStored - len(newDocuments),
 	}
-}
-
-func (se *SearchEngine) activeDocumentCountLocked() int {
-	active := 0
-	for _, internalID := range se.ExternalToInternal {
-		if !se.DocDeleted[internalID] {
-			active++
-		}
-	}
-	return active
 }
 
 func (se *SearchEngine) setFilterBitsLocked(doc map[string]interface{}, internalID uint32, filters map[string]bool) {
@@ -764,7 +857,7 @@ func (se *SearchEngine) SingleTermSearchLoop(
 					score: boostedScore,
 				})
 
-				if SkipWholeScan && len(h) >= k {
+				if SingleTermSkipWholeScan && len(h) >= k {
 					goto BreakLoop
 				}
 			} else if h[0].score < boostedScore {
@@ -943,7 +1036,7 @@ func (se *SearchEngine) MultiTermSearchLoop(
 
 			if len(h) < k {
 				h = heapPushHit(h, internalHit{id: internalID, score: total})
-				if SkipWholeScan && len(h) >= k {
+				if MultiTermSkipWholeScan && len(h) >= k {
 					goto BreakLoop
 				}
 			} else if h[0].score < total {
@@ -1121,12 +1214,12 @@ func (se *SearchEngine) SingleTermSearch(
 	query := queryTokens[0]
 
 	// TODO: make these configurable in SearchEngine.
-	maxPrefixTokens := 3
-	maxFuzzyTokens := 3
+	maxPrefixTokens := SingleTermMaxPrefixTokens
+	maxFuzzyTokens := SingleTermMaxFuzzyTokens
 
 	candidates := make([]termCandidate, 0, 1+maxPrefixTokens+maxFuzzyTokens)
 
-	_, exactExists := se.termSet.Load(query)
+	_, exactExists := se.termSet.Load().Load(query)
 
 	se.mu.RLock()
 
@@ -1201,7 +1294,7 @@ func (se *SearchEngine) MultiTermSearch(
 
 	termArrList := make([][]termCandidate, len(queryTokens))
 
-	_, lastExists := se.termSet.Load(rawLastTerm)
+	_, lastExists := se.termSet.Load().Load(rawLastTerm)
 
 	se.mu.RLock()
 
@@ -1213,7 +1306,7 @@ func (se *SearchEngine) MultiTermSearch(
 	lastTermGuessArr := append([]string(nil), se.Prefix[rawLastTerm][:maxPrefix]...)
 
 	for k, firstTerm := range rawFirstTerms {
-		if _, ok := se.termSet.Load(firstTerm); ok {
+		if _, ok := se.termSet.Load().Load(firstTerm); ok {
 			termArrList[k] = append(termArrList[k], termCandidate{
 				term:  firstTerm,
 				boost: ExactMatchBoost,

@@ -342,6 +342,217 @@ func TestFuzzySearch_ExactMatchNotReturned(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Unicode / multi-script tests
+// ---------------------------------------------------------------------------
+
+// TestSymSpell_CJK verifies that rune-based deletions work for CJK characters.
+// Byte-based deletion would produce invalid UTF-8 keys.
+func TestSymSpell_CJK(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("日本語") // Japanese
+	ss.AddWord("音楽")   // music
+	ss.AddWord("日本")   // Japan (shares prefix)
+
+	tests := []struct {
+		query string
+		want  string
+	}{
+		// "日本" is a 1-rune deletion of "日本語" (drop last rune)
+		{"日本", "日本語"},
+		// "本語" is a 1-rune deletion of "日本語" (drop first rune)
+		{"本語", "日本語"},
+		// "日語" is a 1-rune deletion of "日本語" (drop middle rune)
+		{"日語", "日本語"},
+	}
+	for _, tc := range tests {
+		found := false
+		for _, w := range ss.FuzzySearch(tc.query, 10) {
+			if w == tc.want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("FuzzySearch(%q): want %q in results, got %v", tc.query, tc.want, ss.FuzzySearch(tc.query, 10))
+		}
+	}
+}
+
+// TestSymSpell_Cyrillic verifies fuzzy matching for Cyrillic words.
+func TestSymSpell_Cyrillic(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("привет") // hello
+	ss.AddWord("привет") // duplicate — idempotent
+
+	// "приве" = delete last rune → should find "привет"
+	got := ss.FuzzySearch("приве", 5)
+	found := false
+	for _, w := range got {
+		if w == "привет" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("FuzzySearch(\"приве\") expected \"привет\", got %v", got)
+	}
+}
+
+// TestSymSpell_Greek verifies fuzzy matching for Greek words including accented letters.
+func TestSymSpell_Greek(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("ωμέγα")
+	ss.AddWord("ωμεγα")
+
+	// "ωμέγ" = delete last rune of "ωμέγα"
+	got := ss.FuzzySearch("ωμέγ", 5)
+	found := false
+	for _, w := range got {
+		if w == "ωμέγα" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("FuzzySearch(\"ωμέγ\") expected \"ωμέγα\", got %v", got)
+	}
+}
+
+// TestSymSpell_Arabic verifies that Arabic letters (multi-byte, no case) are handled correctly.
+func TestSymSpell_Arabic(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("موسيقى") // music in Arabic
+
+	// "موسيق" = delete last rune (ى)
+	got := ss.FuzzySearch("موسيق", 5)
+	found := false
+	for _, w := range got {
+		if w == "موسيقى" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("FuzzySearch(\"موسيق\") expected \"موسيقى\", got %v", got)
+	}
+}
+
+// TestSymSpell_Thai verifies Thai words with vowel marks (IsMark runes) work end-to-end.
+func TestSymSpell_Thai(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("ดนตรี") // music in Thai (5 runes: ด น ต ร ี)
+
+	// "ดนตร" = delete last rune (ี, a combining vowel mark)
+	got := ss.FuzzySearch("ดนตร", 5)
+	found := false
+	for _, w := range got {
+		if w == "ดนตรี" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("FuzzySearch(\"ดนตร\") expected \"ดนตรี\", got %v", got)
+	}
+}
+
+// TestSymSpell_Devanagari verifies Devanagari words (with virama/vowel mark runes).
+func TestSymSpell_Devanagari(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("संगीत") // music in Hindi (7 runes including marks)
+
+	// Delete the last rune (त)
+	runes := []rune("संगीत")
+	queryRunes := runes[:len(runes)-1]
+	query := string(queryRunes)
+
+	got := ss.FuzzySearch(query, 5)
+	found := false
+	for _, w := range got {
+		if w == "संगीत" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("FuzzySearch(%q) expected \"संगीत\", got %v", query, got)
+	}
+}
+
+// TestSymSpell_DeleteWord_Unicode verifies DeleteWord works for multi-byte rune words.
+func TestSymSpell_DeleteWord_Unicode(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("日本語")
+	ss.AddWord("日本")
+
+	ss.DeleteWord("日本語")
+
+	// "本語" was a deletion key for "日本語"; after delete it should no longer return it
+	for _, w := range ss.FuzzySearch("本語", 10) {
+		if w == "日本語" {
+			t.Errorf("deleted word \"日本語\" still appears in FuzzySearch results")
+		}
+	}
+	// "日本" itself must still be findable (it was not deleted)
+	got := ss.FuzzySearch("日", 10) // "日" is a deletion of "日本" (drop 本)
+	found := false
+	for _, w := range got {
+		if w == "日本" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("\"日本\" should still be in index after deleting \"日本語\", got %v", got)
+	}
+}
+
+// TestSymSpell_MultiScript verifies a mixed-language dictionary works correctly.
+func TestSymSpell_MultiScript(t *testing.T) {
+	ss := NewSymSpell()
+	words := []string{"hello", "привет", "مرحبا", "שלום", "こんにちは"}
+	ss.LoadDictionary(words)
+
+	cases := []struct {
+		query string // one rune deleted from the front of each word
+		want  string
+	}{
+		{"ello", "hello"},
+		{"ривет", "привет"},
+		{"رحبا", "مرحبا"},
+		{"לום", "שלום"},
+		{"んにちは", "こんにちは"},
+	}
+	for _, c := range cases {
+		got := ss.FuzzySearch(c.query, 10)
+		found := false
+		for _, w := range got {
+			if w == c.want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("FuzzySearch(%q): want %q in results, got %v", c.query, c.want, got)
+		}
+	}
+}
+
+// TestSymSpell_NoByteSplitOnUnicode ensures delete variants are always valid UTF-8.
+// A byte-based implementation would produce invalid UTF-8 keys for multi-byte runes.
+func TestSymSpell_NoByteSplitOnUnicode(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("中文歌曲") // Chinese: 4 runes, each 3 bytes
+
+	for key := range ss.DeleteMap {
+		if !isValidUTF8(key) {
+			t.Errorf("DeleteMap contains invalid UTF-8 key: %x", []byte(key))
+		}
+	}
+}
+
+func isValidUTF8(s string) bool {
+	for _, r := range s {
+		if r == '�' {
+			return false
+		}
+	}
+	return true
+}
+
 // TestDeleteWord_ThenReAdd verifies a word can be re-added after deletion.
 func TestDeleteWord_ThenReAdd(t *testing.T) {
 	ss := NewSymSpell()

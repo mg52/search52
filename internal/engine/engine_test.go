@@ -1737,6 +1737,349 @@ func TestSaveAll_NoTempFileRemains(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// termSet tests
+// ---------------------------------------------------------------------------
+
+// inTermSet is a white-box helper that reads the engine's lock-free termSet.
+func inTermSet(se *SearchEngine, term string) bool {
+	_, ok := se.termSet.Load().Load(term)
+	return ok
+}
+
+// termSetSnapshot returns all terms currently in the termSet as a sorted slice.
+func termSetSnapshot(se *SearchEngine) []string {
+	var terms []string
+	se.termSet.Load().Range(func(k, _ any) bool {
+		terms = append(terms, k.(string))
+		return true
+	})
+	sort.Strings(terms)
+	return terms
+}
+
+func newTermSetEngine() *SearchEngine {
+	return NewSearchEngine(
+		[]string{"title", "artist"},
+		map[string]bool{"genre": true},
+		10,
+	)
+}
+
+// TestTermSet_NonNilOnFreshEngine verifies a new engine has an initialized
+// (non-nil) termSet so the first Load().Load() call cannot panic.
+func TestTermSet_NonNilOnFreshEngine(t *testing.T) {
+	se := newTermSetEngine()
+	if se.termSet.Load() == nil {
+		t.Fatal("termSet pointer is nil on fresh engine")
+	}
+	if inTermSet(se, "anything") {
+		t.Fatal("fresh engine should have empty termSet")
+	}
+}
+
+// TestTermSet_ContainsExactTokensAfterIndex verifies that after indexing a
+// document the termSet holds exactly the lowercased tokens from the index fields.
+func TestTermSet_ContainsExactTokensAfterIndex(t *testing.T) {
+	se := newTermSetEngine()
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":     "1",
+		"title":  "Blue Ocean",
+		"artist": "Sun Kil Moon",
+		"genre":  "folk", // filter field — must NOT be in termSet
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Index fields tokenize to: "blue", "ocean", "sun", "kil", "moon"
+	for _, want := range []string{"blue", "ocean", "sun", "kil", "moon"} {
+		if !inTermSet(se, want) {
+			t.Errorf("expected %q in termSet", want)
+		}
+	}
+	// Filter field value must not be indexed as a term
+	if inTermSet(se, "folk") {
+		t.Error("filter field value \"folk\" must not appear in termSet")
+	}
+	// The external id field must not be indexed as a term
+	if inTermSet(se, "1") {
+		t.Error("document id must not appear in termSet")
+	}
+}
+
+// TestTermSet_StopwordsExcluded verifies "a", "the", "and" are never in termSet.
+func TestTermSet_StopwordsExcluded(t *testing.T) {
+	se := newTermSetEngine()
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "a song and the band",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, sw := range []string{"a", "the", "and"} {
+		if inTermSet(se, sw) {
+			t.Errorf("stopword %q must not be in termSet", sw)
+		}
+	}
+	if !inTermSet(se, "song") || !inTermSet(se, "band") {
+		t.Error("non-stopword tokens must be in termSet")
+	}
+}
+
+// TestTermSet_CaseNormalized verifies tokens are stored lowercase regardless
+// of the original document field casing.
+func TestTermSet_CaseNormalized(t *testing.T) {
+	se := newTermSetEngine()
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "LOUD THUNDER",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !inTermSet(se, "loud") || !inTermSet(se, "thunder") {
+		t.Error("tokens must be stored lowercase")
+	}
+	if inTermSet(se, "LOUD") || inTermSet(se, "THUNDER") {
+		t.Error("uppercase form must not be in termSet")
+	}
+}
+
+// TestTermSet_MultipleDocsSameTermBothPresent verifies that a term shared by
+// two documents appears exactly once in the termSet.
+func TestTermSet_MultipleDocsSameTermBothPresent(t *testing.T) {
+	se := newTermSetEngine()
+	docs := []map[string]interface{}{
+		{"id": "1", "title": "River Song"},
+		{"id": "2", "title": "River Delta"},
+	}
+	for _, d := range docs {
+		if err := se.AddOrUpdateDocument(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if !inTermSet(se, "river") {
+		t.Error("shared term \"river\" must be in termSet")
+	}
+	if !inTermSet(se, "song") || !inTermSet(se, "delta") {
+		t.Error("unique terms must also be in termSet")
+	}
+}
+
+// TestTermSet_DeletedDocTermsRemainUntilCompact verifies that deleting a doc
+// does NOT remove its terms from the termSet — they persist until CompactDeleted.
+func TestTermSet_DeletedDocTermsRemainUntilCompact(t *testing.T) {
+	se := newTermSetEngine()
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "Phantom Signal",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	se.DeleteDocument("1")
+
+	// Terms must still be in termSet (DataMap still has them).
+	if !inTermSet(se, "phantom") || !inTermSet(se, "signal") {
+		t.Error("terms of a deleted doc must remain in termSet until CompactDeleted")
+	}
+}
+
+// TestTermSet_UpdateAddsNewTerms verifies that updating a doc with new content
+// adds the new terms to termSet while old terms also remain.
+func TestTermSet_UpdateAddsNewTerms(t *testing.T) {
+	se := newTermSetEngine()
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "Crimson Wave",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Update with completely different title
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "Golden Storm",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// New terms must be present
+	if !inTermSet(se, "golden") || !inTermSet(se, "storm") {
+		t.Error("new terms from update must be in termSet")
+	}
+	// Old terms also remain (DataMap still holds them until compact)
+	if !inTermSet(se, "crimson") || !inTermSet(se, "wave") {
+		t.Error("old terms must remain in termSet until CompactDeleted")
+	}
+}
+
+// TestTermSet_CompactPrunesOrphanedTerms verifies that after CompactDeleted,
+// terms that belonged exclusively to deleted/old document versions are gone.
+func TestTermSet_CompactPrunesOrphanedTerms(t *testing.T) {
+	se := newTermSetEngine()
+	// Doc 1: add then delete — all its terms become orphaned
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "Vanishing Comet",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	se.DeleteDocument("1")
+
+	// Doc 2: add, then update — old terms "initial draft" become orphaned
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "2",
+		"title": "Initial Draft",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "2",
+		"title": "Final Version",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Doc 3: stays active
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "3",
+		"title": "Survivor Track",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	se.CompactDeleted()
+
+	// Orphaned terms (only used by deleted/old versions) must be gone
+	for _, orphan := range []string{"vanishing", "comet", "initial", "draft"} {
+		if inTermSet(se, orphan) {
+			t.Errorf("orphaned term %q must be removed from termSet after compact", orphan)
+		}
+	}
+	// Active terms must survive
+	for _, active := range []string{"final", "version", "survivor", "track"} {
+		if !inTermSet(se, active) {
+			t.Errorf("active term %q must remain in termSet after compact", active)
+		}
+	}
+}
+
+// TestTermSet_SharedTermSurvivesCompact verifies that a term appearing in both
+// an active doc and a deleted doc is NOT removed after compact.
+func TestTermSet_SharedTermSurvivesCompact(t *testing.T) {
+	se := newTermSetEngine()
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "Shared Echo Gone",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "2",
+		"title": "Shared Echo Lives",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	se.DeleteDocument("1")
+	se.CompactDeleted()
+
+	// "shared" and "echo" are in both docs — must survive because doc 2 is active
+	if !inTermSet(se, "shared") || !inTermSet(se, "echo") {
+		t.Error("term shared by active and deleted doc must survive compact")
+	}
+	// "gone" belongs only to doc 1 (deleted) — must be pruned
+	if inTermSet(se, "gone") {
+		t.Error("term exclusive to deleted doc must be pruned after compact")
+	}
+	// "lives" belongs to doc 2 (active) — must survive
+	if !inTermSet(se, "lives") {
+		t.Error("term from active doc must survive compact")
+	}
+}
+
+// TestTermSet_Unicode verifies that Unicode tokens (CJK, Cyrillic, Arabic) are
+// stored and looked up correctly in the termSet.
+func TestTermSet_Unicode(t *testing.T) {
+	se := newTermSetEngine()
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "日本語 音楽", // Japanese: "Japanese language" and "music"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "2",
+		"title": "ПРИВЕТ МИР", // Russian: "hello world"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "3",
+		"title": "موسيقى عربية", // Arabic: "Arabic music"
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, term := range []string{"日本語", "音楽", "привет", "мир", "موسيقى", "عربية"} {
+		if !inTermSet(se, term) {
+			t.Errorf("Unicode term %q must be in termSet", term)
+		}
+	}
+	// Uppercase Cyrillic must not appear — stored lowercase
+	if inTermSet(se, "ПРИВЕТ") {
+		t.Error("uppercase Cyrillic must not be in termSet")
+	}
+}
+
+// TestTermSet_BuildDocumentIndex verifies that batch indexing via
+// BuildDocumentIndex populates the termSet identically to per-doc indexing.
+func TestTermSet_BuildDocumentIndex(t *testing.T) {
+	se := newTermSetEngine()
+
+	// Pre-register external IDs so BuildDocumentIndex can resolve them.
+	se.mu.Lock()
+	se.Documents[1] = map[string]interface{}{"id": "1", "title": "Midnight Rain", "artist": "Clara"}
+	se.Documents[2] = map[string]interface{}{"id": "2", "title": "Desert Wind", "artist": "Omar"}
+	se.ExternalToInternal["1"] = 1
+	se.ExternalToInternal["2"] = 2
+	se.InternalToExternal[1] = "1"
+	se.InternalToExternal[2] = "2"
+	se.nextInternalID = 3
+	se.mu.Unlock()
+
+	se.BuildDocumentIndex([]map[string]interface{}{
+		{"id": "1", "title": "Midnight Rain", "artist": "Clara"},
+		{"id": "2", "title": "Desert Wind", "artist": "Omar"},
+	})
+
+	for _, term := range []string{"midnight", "rain", "clara", "desert", "wind", "omar"} {
+		if !inTermSet(se, term) {
+			t.Errorf("term %q missing from termSet after BuildDocumentIndex", term)
+		}
+	}
+}
+
+// TestTermSet_UnindexedTermAbsent verifies that arbitrary strings not derived
+// from indexed documents are never present in termSet.
+func TestTermSet_UnindexedTermAbsent(t *testing.T) {
+	se := newTermSetEngine()
+	if err := se.AddOrUpdateDocument(map[string]interface{}{
+		"id":    "1",
+		"title": "Bright Star",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, absent := range []string{"dark", "moon", "planet", "galaxy", "nebula"} {
+		if inTermSet(se, absent) {
+			t.Errorf("term %q was never indexed but appears in termSet", absent)
+		}
+	}
+}
+
 func assertEnginesEquivalent(t *testing.T, want, got *SearchEngine) {
 	t.Helper()
 

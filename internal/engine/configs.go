@@ -1,9 +1,12 @@
 package engine
 
 const MaxPrefixTerms = 5_000
-const SkipWholeScan = false
 const SkipUpdatePrefix = false
 const ExactMatchBoost = 10
+const SingleTermMaxPrefixTokens = 3
+const SingleTermMaxFuzzyTokens = 2
+const SingleTermSkipWholeScan = true
+const MultiTermSkipWholeScan = false
 
 // multiTermPrefixLimit caps prefix expansion for the last token of a multi-term
 // query. Lower than prefixLimitForQuery because each extra candidate multiplies

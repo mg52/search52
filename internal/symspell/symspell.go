@@ -18,16 +18,17 @@ func NewSymSpell() *SymSpell {
 	}
 }
 
-// AddWord indexes a new word by generating all its single-character deletes.
+// AddWord indexes a new word by generating all its single-rune deletes.
 func (s *SymSpell) AddWord(word string) {
 	s.appendUnique(word, word)
-	if len(word) < 2 {
+	runes := []rune(word)
+	if len(runes) < 2 {
 		return
 	}
-	buf := make([]byte, len(word)-1)
-	for i := 0; i < len(word); i++ {
-		copy(buf, word[:i])
-		copy(buf[i:], word[i+1:])
+	buf := make([]rune, len(runes)-1)
+	for i := range runes {
+		copy(buf, runes[:i])
+		copy(buf[i:], runes[i+1:])
 		s.appendUnique(string(buf), word)
 	}
 }
@@ -52,13 +53,14 @@ func (s *SymSpell) LoadDictionary(words []string) {
 // DeleteWord removes a word from the SymSpell index.
 func (s *SymSpell) DeleteWord(word string) {
 	s.removeFrom(word, word)
-	if len(word) < 2 {
+	runes := []rune(word)
+	if len(runes) < 2 {
 		return
 	}
-	buf := make([]byte, len(word)-1)
-	for i := 0; i < len(word); i++ {
-		copy(buf, word[:i])
-		copy(buf[i:], word[i+1:])
+	buf := make([]rune, len(runes)-1)
+	for i := range runes {
+		copy(buf, runes[:i])
+		copy(buf[i:], runes[i+1:])
 		s.removeFrom(string(buf), word)
 	}
 }
@@ -110,14 +112,15 @@ func (s *SymSpell) FuzzySearch(query string, maxReturnCount int) []string {
 		return results
 	}
 
-	if len(query) < 2 {
+	runes := []rune(query)
+	if len(runes) < 2 {
 		return results
 	}
 
-	buf := make([]byte, len(query)-1)
-	for i := 0; i < len(query); i++ {
-		copy(buf, query[:i])
-		copy(buf[i:], query[i+1:])
+	buf := make([]rune, len(runes)-1)
+	for i := range runes {
+		copy(buf, runes[:i])
+		copy(buf[i:], runes[i+1:])
 		if add(string(buf)) {
 			break
 		}

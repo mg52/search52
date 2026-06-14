@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mg52/search52/internal/engine"
 )
 
 type loadTestMode struct{ multi, filter bool }
@@ -50,6 +54,8 @@ func runLoadtest(args []string) {
 	modeMix := fs.String("mode-mix", "random", "Mode mix: random or balanced. Balanced matches benchmark.go's four modes evenly.")
 	prefixMinLen := fs.Int("prefix-min-len", 1, "Minimum generated prefix length for prefix queries")
 	prefixMaxLen := fs.Int("prefix-max-len", 10, "Maximum generated prefix length for prefix queries")
+	docsFile := fs.String("docs", "", "JSON document file; when set, multi-term queries pick 2-4 terms from the same document")
+	docFields := fs.String("doc-fields", "title,artist,album", "Comma-separated fields to tokenize from the docs file")
 	_ = fs.Parse(args)
 	if *prefixMinLen < 1 {
 		fmt.Fprintf(os.Stderr, "prefix-min-len must be >= 1\n")
@@ -97,7 +103,20 @@ func runLoadtest(args []string) {
 		queryPool = queryPoolSize
 	}
 	singleQs := buildLoadtestSingleQueries(querySeed, vocab, queryPool, *prefixMinLen, *prefixMaxLen)
-	multiQs := buildLoadtestMultiQueries(querySeed, vocab, queryPool, *prefixMinLen, *prefixMaxLen)
+
+	var multiQs []loadTestQuery
+	if *docsFile != "" {
+		pools, err := loadDocTokenPools(*docsFile, splitCSV(*docFields))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "docs: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Doc pools: %d documents with ≥2 tokens from %s\n", len(pools), *docsFile)
+		multiQs = buildLoadtestMultiQueriesFromDocs(querySeed, pools, queryPool, *prefixMinLen, *prefixMaxLen)
+	} else {
+		multiQs = buildLoadtestMultiQueries(querySeed, vocab, queryPool, *prefixMinLen, *prefixMaxLen)
+	}
+
 	yearFs := buildYearFilters(querySeed, queryPool)
 	yearFilterValue := func(i int) int {
 		values := yearFs[i%len(yearFs)]["year"]
@@ -172,6 +191,9 @@ func runLoadtest(args []string) {
 						atomic.AddInt64(&errCount, 1)
 						res.err = true
 					}
+					// if res.lat > 100*time.Millisecond {
+					// 	fmt.Fprintf(os.Stderr, "[slow %s] %s\n", res.lat.Round(time.Millisecond), q)
+					// }
 				}
 				if reqErr != nil {
 					res.lat = time.Since(t0)
@@ -382,7 +404,7 @@ func printQueryStrategyTable(singleQs, multiQs []loadTestQuery) {
 	fmt.Printf("\nQuery generation details\n\n")
 	fmt.Printf("| Query set | Pool size | Exact | Prefix | Misspelled | 2 terms | 3 terms | 4 terms | Strategy |\n")
 	fmt.Printf("|---|---:|---:|---:|---:|---:|---:|---:|---|\n")
-	fmt.Printf("| Single-term | %d | %d | %d | %d | - | - | - | 65%% exact, 25%% prefix, 10%% misspelled; prefix length uses configured min/max |\n",
+	fmt.Printf("| Single-term | %d | %d | %d | %d | - | - | - | 65%% prefix, 20%% exact, 15%% misspelled; prefix length uses configured min/max |\n",
 		len(singleQs),
 		singleExact,
 		singlePrefix,
@@ -415,15 +437,16 @@ func buildLoadtestSingleQueries(r *rand.Rand, vocab []string, count, prefixMinLe
 		kind := "exact"
 		prefixLen := 0
 		switch {
-		case roll < 0.10:
+		case roll < 0.15: // 15% misspelled
 			word = misspellWord(r, word)
 			kind = "misspelled"
-		case roll < 0.35:
+		case roll < 0.80: // 65% prefix (0.15–0.80)
 			if prefix, n, ok := loadtestPrefixWord(r, word, prefixMinLen, prefixMaxLen); ok {
 				word = prefix
 				prefixLen = n
 				kind = "prefix"
 			}
+			// else: 20% exact (0.80–1.0)
 		}
 		qs[i] = loadTestQuery{query: word, kind: kind, misspelled: kind == "misspelled", prefix: kind == "prefix", prefixLen: prefixLen, terms: 1}
 	}
@@ -483,11 +506,11 @@ func ltSingleQuery(r *rand.Rand, vocab []string) string {
 	word := vocab[r.Intn(len(vocab))]
 	roll := r.Float64()
 	switch {
-	case roll < 0.10:
+	case roll < 0.15: // 15% misspelled
 		return misspellWord(r, word)
-	case roll < 0.35:
+	case roll < 0.80: // 65% prefix
 		return prefixWord(r, word)
-	default:
+	default: // 20% exact
 		return word
 	}
 }
@@ -586,4 +609,112 @@ func pctDur(sorted []time.Duration, p int) time.Duration {
 		idx = n - 1
 	}
 	return sorted[idx]
+}
+
+// loadDocTokenPools streams the JSON document file and returns a slice of
+// token sets, one per document. Only documents with at least 2 distinct tokens
+// are included. Tokens are deduplicated within each document.
+func loadDocTokenPools(path string, fields []string) ([][]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(bufio.NewReaderSize(f, 16*1024*1024))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("read opening token: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '[' {
+		return nil, fmt.Errorf("%s must be a JSON array", path)
+	}
+
+	var pools [][]string
+	for dec.More() {
+		var doc map[string]interface{}
+		if err := dec.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("decode document: %w", err)
+		}
+		seen := make(map[string]struct{})
+		var tokens []string
+		for _, field := range fields {
+			val, ok := doc[field]
+			if !ok {
+				continue
+			}
+			var toks []string
+			switch v := val.(type) {
+			case string:
+				toks = engine.Tokenize(v)
+			case []interface{}:
+				for _, item := range v {
+					if s, ok := item.(string); ok {
+						toks = append(toks, engine.Tokenize(s)...)
+					}
+				}
+			}
+			for _, t := range toks {
+				if _, exists := seen[t]; !exists {
+					seen[t] = struct{}{}
+					tokens = append(tokens, t)
+				}
+			}
+		}
+		if len(tokens) >= 2 {
+			pools = append(pools, tokens)
+		}
+	}
+	if len(pools) == 0 {
+		return nil, fmt.Errorf("no documents with ≥2 tokens found in %s (fields: %v)", path, fields)
+	}
+	return pools, nil
+}
+
+// buildLoadtestMultiQueriesFromDocs builds multi-term queries by picking 2-4
+// tokens from the same document, so the query has a real intersection in the
+// index. Misspell (10%) and last-token prefix-truncation (25%) are applied
+// with the same probabilities as the vocab-based builder.
+func buildLoadtestMultiQueriesFromDocs(r *rand.Rand, pools [][]string, count, prefixMinLen, prefixMaxLen int) []loadTestQuery {
+	qs := make([]loadTestQuery, count)
+	for i := range qs {
+		pool := pools[r.Intn(len(pools))]
+		nTerms := 2 + r.Intn(3) // 2, 3, or 4
+
+		// Shuffle a copy so we sample distinct tokens when the pool is large enough.
+		perm := r.Perm(len(pool))
+		terms := make([]string, nTerms)
+		for j := 0; j < nTerms; j++ {
+			terms[j] = pool[perm[j%len(perm)]]
+		}
+
+		misspelled := false
+		prefix := false
+		prefixLen := 0
+		misspellIdx := -1
+		if r.Float64() < 0.10 {
+			misspellIdx = r.Intn(nTerms)
+		}
+		for j := 0; j < nTerms; j++ {
+			switch {
+			case j == misspellIdx:
+				terms[j] = misspellWord(r, terms[j])
+				misspelled = true
+			case j == nTerms-1 && misspellIdx != nTerms-1 && r.Float64() < 0.25:
+				if pfx, n, ok := loadtestPrefixWord(r, terms[j], prefixMinLen, prefixMaxLen); ok {
+					terms[j] = pfx
+					prefix = true
+					prefixLen = n
+				}
+			}
+		}
+		qs[i] = loadTestQuery{
+			query:      joinTerms(terms),
+			misspelled: misspelled,
+			prefix:     prefix,
+			prefixLen:  prefixLen,
+			terms:      nTerms,
+		}
+	}
+	return qs
 }
