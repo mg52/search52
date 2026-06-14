@@ -464,14 +464,6 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ht.mu.RLock()
-	_, exists := ht.engines[req.IndexName]
-	ht.mu.RUnlock()
-	if exists {
-		errJSON(w, http.StatusConflict, fmt.Errorf("index %q already exists", req.IndexName))
-		return
-	}
-
 	filterMap := make(map[string]bool, len(req.Filters))
 	for _, f := range req.Filters {
 		filterMap[f] = true
@@ -487,8 +479,16 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	elapsed := time.Since(start)
 
 	ht.mu.Lock()
-	ht.engines[req.IndexName] = sec
+	_, exists := ht.engines[req.IndexName]
+	if !exists {
+		ht.engines[req.IndexName] = sec
+	}
 	ht.mu.Unlock()
+
+	if exists {
+		errJSON(w, http.StatusConflict, fmt.Errorf("index %q already exists", req.IndexName))
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -572,7 +572,8 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 	elapsed := time.Since(start)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(AddToIndexResponse{
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(AddToIndexResponse{
 		Status:     "success",
 		StatusCode: http.StatusOK,
 		IndexName:  indexName,

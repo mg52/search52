@@ -142,8 +142,8 @@ func TestSingleTermSearchBoostsExactMatchOverPrefixCandidate(t *testing.T) {
 	if res.Docs[0].ID != "exact" {
 		t.Fatalf("expected exact match first, got %+v", res.Docs)
 	}
-	if res.Docs[0].Score != 200000 {
-		t.Fatalf("expected exact score to be boosted to 200000, got %+v", res.Docs[0])
+	if res.Docs[0].Score != 1_000_000 {
+		t.Fatalf("expected exact score to be boosted to 1000000 (ExactMatchBoost=%d), got %+v", ExactMatchBoost, res.Docs[0])
 	}
 	if res.Docs[1].ID != "prefix" || res.Docs[1].Score != 100000 {
 		t.Fatalf("expected unboosted prefix candidate second, got %+v", res.Docs[1])
@@ -192,10 +192,10 @@ func TestMultiTermSearchBoostsExactMatchOverPrefixCandidate(t *testing.T) {
 	if res.Docs[0].ID != "exact" {
 		t.Fatalf("expected exact last-term match first, got %+v", res.Docs)
 	}
-	if res.Docs[0].Score != 200000 {
-		t.Fatalf("expected exact multi-term score to be boosted to 200000, got %+v", res.Docs[0])
+	if res.Docs[0].Score != 1_000_000 {
+		t.Fatalf("expected exact multi-term score to be boosted to 1000000 (ExactMatchBoost=%d), got %+v", ExactMatchBoost, res.Docs[0])
 	}
-	if res.Docs[1].ID != "prefix" || res.Docs[1].Score != 150000 {
+	if res.Docs[1].ID != "prefix" || res.Docs[1].Score != 550000 {
 		t.Fatalf("expected prefix candidate to keep only first-term exact boost, got %+v", res.Docs[1])
 	}
 }
@@ -916,11 +916,11 @@ func Test_E2E(t *testing.T) {
 	}
 
 	if len(res.Docs) != 5 {
-		t.Fatalf("expected 3 results, got %d: %+v", len(res.Docs), res.Docs)
+		t.Fatalf("expected 5 results (ResultSize cap), got %d: %+v", len(res.Docs), res.Docs)
 	}
 
-	if res.Docs[0].ID != "21" && res.Docs[0].Score != 66664 {
-		t.Fatalf("expected first results is different, got ID: %s: %d", res.Docs[0].ID, res.Docs[0].Score)
+	if res.Docs[0].ID != "21" || res.Docs[0].Score != 66664 {
+		t.Fatalf("expected first result ID=21 score=66664, got ID=%s score=%d", res.Docs[0].ID, res.Docs[0].Score)
 	}
 }
 
@@ -1713,6 +1713,28 @@ func TestIndexBatchingMatchesSingleBatch(t *testing.T) {
 	batched.Index(docs[66:])
 
 	assertEnginesEquivalent(t, oneShot, batched)
+}
+
+func TestSaveAll_NoTempFileRemains(t *testing.T) {
+	se := NewSearchEngine([]string{"name"}, nil, 10)
+	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "name": "hello world"}); err != nil {
+		t.Fatalf("AddOrUpdateDocument: %v", err)
+	}
+
+	dir := t.TempDir()
+	if err := se.SaveAll(dir); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+
+	gobPath := filepath.Join(dir, "engine.gob")
+	if _, err := os.Stat(gobPath); err != nil {
+		t.Fatalf("engine.gob not found after SaveAll: %v", err)
+	}
+
+	tmpPath := gobPath + ".tmp"
+	if _, err := os.Stat(tmpPath); err == nil {
+		t.Fatal("engine.gob.tmp must not remain after a successful SaveAll")
+	}
 }
 
 func assertEnginesEquivalent(t *testing.T, want, got *SearchEngine) {

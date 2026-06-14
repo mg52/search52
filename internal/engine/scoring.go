@@ -82,6 +82,9 @@ func weightedTokenScores(doc map[string]interface{}, indexFields []string, field
 	localScores := make(map[string]int, totalTokens)
 	for _, set := range sets {
 		normalizedScore := 100_000 * set.weight / totalWeightedSize
+		if normalizedScore == 0 {
+			normalizedScore = 1
+		}
 		for _, token := range set.tokens {
 			localScores[token] += normalizedScore
 		}

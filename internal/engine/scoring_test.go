@@ -1,6 +1,9 @@
 package engine
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestWeightedFieldsAffectRanking(t *testing.T) {
 	se := NewSearchEngineWithFieldWeights(
@@ -189,5 +192,25 @@ func TestWeightedTokenScoresHandlesStringSlices(t *testing.T) {
 
 	if scores["apple"] <= scores["quiet"] {
 		t.Fatalf("expected weighted title apple score to exceed artist-only quiet score: %+v", scores)
+	}
+}
+
+func TestWeightedTokenScores_ScoreFloorIsOne(t *testing.T) {
+	// When totalWeightedSize > 100_000 * weight, integer division yields 0,
+	// making every token in that field invisible. The fix clamps to 1.
+	const n = 100_001
+	words := make([]string, n)
+	for i := range words {
+		words[i] = fmt.Sprintf("tok%d", i)
+	}
+	doc := map[string]interface{}{"id": "big", "body": words}
+	scores := weightedTokenScores(doc, []string{"body"}, map[string]int{"body": 1})
+	if len(scores) == 0 {
+		t.Fatal("expected non-empty scores for a large document")
+	}
+	for term, score := range scores {
+		if score < 1 {
+			t.Fatalf("term %q has score %d; want >= 1 (normalizedScore floor fix)", term, score)
+		}
 	}
 }

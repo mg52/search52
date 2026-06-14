@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mg52/search52/internal/engine"
@@ -458,6 +459,54 @@ func TestSearchHandler_Errors(t *testing.T) {
 	h.Search(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("GET /search unconfigured filter expected 400, got %d", rr.Code)
+	}
+}
+
+func TestCreateIndexHandler_ConcurrentNoDuplicate(t *testing.T) {
+	// Verifies the TOCTOU fix: concurrent creates must produce exactly one 201
+	// and all others 409 — no silent overwrite, no data race.
+	h := NewHTTP()
+
+	const goroutines = 20
+	codes := make([]int, goroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			body := `{"indexName":"shared","indexFields":["name"],"resultCount":5}`
+			req := httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+			h.CreateIndex(rr, req)
+			codes[idx] = rr.Code
+		}(i)
+	}
+	wg.Wait()
+
+	created, conflicted := 0, 0
+	for _, code := range codes {
+		switch code {
+		case http.StatusCreated:
+			created++
+		case http.StatusConflict:
+			conflicted++
+		default:
+			t.Errorf("unexpected status code %d", code)
+		}
+	}
+	if created != 1 {
+		t.Errorf("expected exactly 1 created, got %d", created)
+	}
+	if conflicted != goroutines-1 {
+		t.Errorf("expected %d conflicts, got %d", goroutines-1, conflicted)
+	}
+
+	h.mu.RLock()
+	se, exists := h.engines["shared"]
+	h.mu.RUnlock()
+	if !exists || se == nil {
+		t.Fatal("index 'shared' must exist after concurrent creation")
 	}
 }
 

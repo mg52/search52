@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -99,6 +100,31 @@ func TestAdminMuxAllowsPublicRoutesWithoutAdminKey(t *testing.T) {
 				t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 			}
 		})
+	}
+}
+
+func TestAdminMuxRejectsAllWhenAdminKeyUnset(t *testing.T) {
+	t.Setenv("ADMINKEY", "")
+	mux := newAdminMux(handler.NewHTTP())
+
+	req := httptest.NewRequest(http.MethodPost, "/api/create-index", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	// Provide a key anyway — server must still reject because ADMINKEY is unset.
+	req.Header.Set("X-Admin-Key", "anything")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when ADMINKEY env var is unset, got %d", rec.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	errMsg, _ := resp["error"].(string)
+	if !strings.Contains(errMsg, "ADMINKEY") {
+		t.Fatalf("expected error message to mention ADMINKEY, got %q", errMsg)
 	}
 }
 

@@ -38,13 +38,13 @@ HTTP load-test results:
 
 The load-test client drains each response body before recording latency.
 
-| Scope | Workers | Queries | Errors | HTTP statuses | Wall time | RPS | avg | p50 | p95 | p99 |
-|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| Overall | 16 | 100 000 | 0 | 200:100000 | 20.349 s | 4 914.4 | 3.24 ms | 1.78 ms | 11.41 ms | 21.33 ms |
-| Single / NoFilter | 16 | 25 000 | 0 | 200:25000 | 20.349 s | 1 228.6 | 4.30 ms | 1.83 ms | 15.40 ms | 26.51 ms |
-| Single / Filter | 16 | 25 000 | 0 | 200:25000 | 20.349 s | 1 228.6 | 2.57 ms | 1.13 ms | 10.23 ms | 21.41 ms |
-| Multi / NoFilter | 16 | 25 000 | 0 | 200:25000 | 20.349 s | 1 228.6 | 3.28 ms | 2.24 ms | 8.92 ms | 17.80 ms |
-| Multi / Filter | 16 | 25 000 | 0 | 200:25000 | 20.349 s | 1 228.6 | 2.80 ms | 1.89 ms | 7.90 ms | 15.15 ms |
+| Scope | Workers | Queries | Errors | Client errors | HTTP statuses | Wall time | RPS | avg | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| Overall | 16 | 100000 | 0 | 0 | {200:100000} | 20.703s | 4830.3 | 3.29ms | 1.20ms | 9.48ms | 32.54ms |
+| Single / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 20.703s | 1207.6 | 4.84ms | 1.32ms | 13.67ms | 54.30ms |
+| Single / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 20.703s | 1207.6 | 3.94ms | 0.92ms | 12.63ms | 55.88ms |
+| Multi / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 20.703s | 1207.6 | 2.33ms | 1.35ms | 6.77ms | 18.10ms |
+| Multi / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 20.703s | 1207.6 | 2.05ms | 1.20ms | 6.15ms | 15.74ms |
 
 ### In-process benchmark
 
@@ -120,7 +120,7 @@ DataMap map[string]map[uint32]int
 // term → internalDocID → score
 ```
 
-Every document is tokenized from the configured `IndexFields`. Tokenization lowercases the text, strips every non-alphanumeric character (via a compiled regexp), and drops a fixed stop-word list (`a`, `the`, `and`). Index fields can optionally define `fieldWeights`; missing weights default to `1`, while the HTTP API rejects non-positive weights. Each token receives a normalized score based on its field weight, so a token from a field with weight `3` is worth three times a token from a field with weight `1` while keeping the document's total score budget roughly stable. If the same token appears multiple times its scores are summed, so denser matches rank higher. `DataMap` is the primary posting-list and ranking structure used by the search hot path.
+Every document is tokenized from the configured `IndexFields`. Tokenization lowercases the text, strips every non-ASCII-alphanumeric character, and drops a fixed stop-word list (`a`, `the`, `and`). Index fields can optionally define `fieldWeights`; missing weights default to `1`, while the HTTP API rejects non-positive weights. Each token receives a normalized score based on its field weight, so a token from a field with weight `3` is worth three times a token from a field with weight `1` while keeping the document's total score budget roughly stable. If the same token appears multiple times its scores are summed, so denser matches rank higher. `DataMap` is the primary posting-list and ranking structure used by the search hot path.
 
 ### 2. Internal IDs and Tombstones
 

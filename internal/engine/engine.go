@@ -193,16 +193,30 @@ func (se *SearchEngine) SaveAll(path string) error {
 	}
 
 	engineFile := path + "/engine.gob"
-	f, err := os.Create(engineFile)
+	tmpFile := engineFile + ".tmp"
+
+	f, err := os.Create(tmpFile)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", engineFile, err)
+		return fmt.Errorf("create %s: %w", tmpFile, err)
 	}
-	defer f.Close()
 
 	enc := gob.NewEncoder(f)
-	if err := enc.Encode(payload); err != nil {
-		return fmt.Errorf("encode engine payload: %w", err)
+	if encErr := enc.Encode(payload); encErr != nil {
+		f.Close()
+		os.Remove(tmpFile)
+		return fmt.Errorf("encode engine payload: %w", encErr)
 	}
+
+	if err := f.Close(); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("close %s: %w", tmpFile, err)
+	}
+
+	if err := os.Rename(tmpFile, engineFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("rename %s to %s: %w", tmpFile, engineFile, err)
+	}
+
 	return nil
 }
 
@@ -286,14 +300,9 @@ func LoadAll(path string) (*SearchEngine, error) {
 		return ok && cur == internalID
 	}
 
+	se.mu.Lock()
 	for internalID, doc := range se.Documents {
-		if doc == nil {
-			continue
-		}
-		if se.DocDeleted[internalID] {
-			continue
-		}
-		if !isCurrent(internalID) {
+		if doc == nil || se.DocDeleted[internalID] || !isCurrent(internalID) {
 			continue
 		}
 
@@ -302,14 +311,12 @@ func LoadAll(path string) (*SearchEngine, error) {
 			continue
 		}
 
-		se.mu.Lock()
 		for token, score := range localScores {
 			se.indexTokenLocked(token, internalID, score)
 		}
-
 		se.setFilterBitsLocked(doc, internalID, se.Filters)
-		se.mu.Unlock()
 	}
+	se.mu.Unlock()
 
 	return se, nil
 }
@@ -1198,7 +1205,7 @@ func (se *SearchEngine) MultiTermSearch(
 
 	se.mu.RLock()
 
-	maxPrefix := prefixLimitForQuery(rawLastTerm)
+	maxPrefix := multiTermPrefixLimit(rawLastTerm)
 	if len(se.Prefix[rawLastTerm]) < maxPrefix {
 		maxPrefix = len(se.Prefix[rawLastTerm])
 	}

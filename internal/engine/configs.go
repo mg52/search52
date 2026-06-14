@@ -5,12 +5,17 @@ const SkipWholeScan = false
 const SkipUpdatePrefix = false
 const ExactMatchBoost = 10
 
-func prefixLimitForQuery(prefix string) int {
+// multiTermPrefixLimit caps prefix expansion for the last token of a multi-term
+// query. Lower than prefixLimitForQuery because each extra candidate multiplies
+// the inner-loop cost by the size of every other group's anchor posting list.
+// The prefix map is sorted by term frequency so top-N still covers the most
+// relevant completions.
+func multiTermPrefixLimit(prefix string) int {
 	switch {
 	case len(prefix) <= 2:
-		return 200
+		return 30
 	case len(prefix) <= 5:
-		return 150
+		return 80
 	default:
 		return 100
 	}

@@ -19,6 +19,10 @@ import (
 var adminFiles embed.FS
 
 func main() {
+	if os.Getenv("ADMINKEY") == "" {
+		log.Println("WARNING: ADMINKEY is not set; all admin routes will return 401")
+	}
+
 	ht := handler.NewHTTP()
 
 	apiAddr := getenv("SEARCH52_API_ADDR", ":8080")
@@ -27,7 +31,7 @@ func main() {
 	apiSrv := &http.Server{
 		Addr:              apiAddr,
 		Handler:           newAPIMux(ht),
-		ReadHeaderTimeout: 10 * time.Hour,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	adminSrv := &http.Server{
 		Addr:              adminAddr,
@@ -95,8 +99,14 @@ func newAdminMux(ht *handler.HTTP) *http.ServeMux {
 func requireAdminKey(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		expected := os.Getenv("ADMINKEY")
+		if expected == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"status":"error","statusCode":401,"error":"ADMINKEY environment variable is not set; all admin routes are disabled"}`))
+			return
+		}
 		actual := r.Header.Get("X-Admin-Key")
-		if expected == "" || actual == "" || subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
+		if actual == "" || subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"status":"error","statusCode":401,"error":"unauthorized"}`))
