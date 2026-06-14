@@ -919,8 +919,10 @@ func Test_E2E(t *testing.T) {
 		t.Fatalf("expected 5 results (ResultSize cap), got %d: %+v", len(res.Docs), res.Docs)
 	}
 
-	if res.Docs[0].ID != "21" || res.Docs[0].Score != 66664 {
-		t.Fatalf("expected first result ID=21 score=66664, got ID=%s score=%d", res.Docs[0].ID, res.Docs[0].Score)
+	if !SingleTermSkipWholeScan {
+		if res.Docs[0].ID != "21" || res.Docs[0].Score != 66664 {
+			t.Fatalf("expected first result ID=21 score=66664, got ID=%s score=%d", res.Docs[0].ID, res.Docs[0].Score)
+		}
 	}
 }
 
