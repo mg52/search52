@@ -65,6 +65,16 @@ type enginePayload struct {
 	ResultSize         int
 }
 
+type termCandidate struct {
+	term  string
+	boost int // 1 normal, ExactmatchBoost for exact
+}
+
+type postingCandidate struct {
+	m     map[uint32]int
+	boost int
+}
+
 // SearchEngine maintains an inverted index plus auxiliary structures for
 // prefix and fuzzy lookup. It is safe for concurrent use.
 type SearchEngine struct {
@@ -649,11 +659,20 @@ func copyDocument(doc map[string]interface{}) map[string]interface{} {
 }
 
 // -------------------- Search --------------------
-// SingleTermSearchLoop returns the top-k matching documents for a single term, ranked
-// by score descending. If filters is non-empty, only documents passing the
-// filter are considered. The whole function holds RLock to avoid concurrent
-// map read/write panics with index updates.
-func (se *SearchEngine) SingleTermSearchLoop(ctx context.Context, query string, filters map[string][]interface{}) ([]ReturnedDocument, error) {
+// SingleTermSearchLoop searches candidate terms with per-term boosts and
+// returns the top-k matching documents ranked by score descending. If filters
+// is non-empty, only documents passing the filter are considered. The whole
+// function holds RLock to avoid concurrent map read/write panics with index
+// updates.
+func (se *SearchEngine) SingleTermSearchLoop(
+	ctx context.Context,
+	candidates []termCandidate,
+	filters map[string][]interface{},
+) ([]ReturnedDocument, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
@@ -669,42 +688,84 @@ func (se *SearchEngine) SingleTermSearchLoop(ctx context.Context, query string, 
 		}
 	}
 
-	postings := se.DataMap[query]
-	if len(postings) == 0 {
+	k := se.ResultSize
+	if k <= 0 {
 		return nil, nil
 	}
 
-	k := se.ResultSize
-	if k <= 0 {
+	dataMap := se.DataMap
+
+	postings := make([]postingCandidate, 0, len(candidates))
+	totalPostingSize := 0
+
+	for _, cand := range candidates {
+		m := dataMap[cand.term]
+		if len(m) == 0 {
+			continue
+		}
+
+		postings = append(postings, postingCandidate{
+			m:     m,
+			boost: cand.boost,
+		})
+		totalPostingSize += len(m)
+	}
+
+	if len(postings) == 0 {
 		return nil, nil
 	}
 
 	deleted := se.DocDeleted
 	h := make([]internalHit, 0, k)
 
-	scanned := 0
-	for id, score := range postings {
-		scanned++
-		if scanned%1024 == 0 {
-			if err := ctx.Err(); err != nil {
-				return nil, ErrSearchCanceled
-			}
-		}
-		if deleted[id] {
-			continue
-		}
-		if allowed != nil && !filterBitTest(allowed, id) {
-			continue
-		}
+	var visited map[uint32]struct{}
+	if len(postings) > 1 {
+		visited = make(map[uint32]struct{}, totalPostingSize)
+	}
 
-		if len(h) < k {
-			// TODO: term based boost can be added here. example: if category:outdoor -> increase score
-			h = heapPushHit(h, internalHit{id: id, score: score})
-			if SkipWholeScan && len(h) >= k {
-				goto BreakLoop
+	scanned := 0
+
+	for _, posting := range postings {
+		for id, score := range posting.m {
+			scanned++
+			if scanned%1024 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, ErrSearchCanceled
+				}
 			}
-		} else if h[0].score < score {
-			heapReplaceTop(h, internalHit{id: id, score: score})
+
+			if visited != nil {
+				if _, seen := visited[id]; seen {
+					continue
+				}
+				visited[id] = struct{}{}
+			}
+
+			if deleted[id] {
+				continue
+			}
+
+			if allowed != nil && !filterBitTest(allowed, id) {
+				continue
+			}
+
+			boostedScore := score * posting.boost
+
+			if len(h) < k {
+				h = heapPushHit(h, internalHit{
+					id:    id,
+					score: boostedScore,
+				})
+
+				if SkipWholeScan && len(h) >= k {
+					goto BreakLoop
+				}
+			} else if h[0].score < boostedScore {
+				heapReplaceTop(h, internalHit{
+					id:    id,
+					score: boostedScore,
+				})
+			}
 		}
 	}
 
@@ -714,30 +775,37 @@ BreakLoop:
 		return nil, nil
 	}
 
-	// Extract in descending order via repeated heap-pop.
 	extMap := se.InternalToExternal
 	docs := se.Documents
 	out := make([]ReturnedDocument, n)
+
 	for i := n - 1; i >= 0; i-- {
 		hit := h[0]
+
 		if i > 0 {
 			h[0] = h[i]
 			siftDownHit(h, 0, i)
 		}
+
 		out[i] = ReturnedDocument{
 			ID:    extMap[hit.id],
 			Data:  docs[hit.id],
 			Score: hit.score,
 		}
 	}
+
 	return out, nil
 }
 
-// MultiTermSearchLoop returns the top-k matching documents for a multi-term query
-// expressed as groups of synonyms. Semantics: AND across groups, OR within a
-// group. If filters is non-empty, only documents passing the filter are
-// considered. RLock is held for the whole function.
-func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][]string, filters map[string][]interface{}) ([]ReturnedDocument, error) {
+// MultiTermSearchLoop returns the top-k matching documents for a multi-term
+// query expressed as boosted groups of synonyms. Semantics: AND across groups,
+// OR within a group. If filters is non-empty, only documents passing the filter
+// are considered. RLock is held for the whole function.
+func (se *SearchEngine) MultiTermSearchLoop(
+	ctx context.Context,
+	termArrList [][]termCandidate,
+	filters map[string][]interface{},
+) ([]ReturnedDocument, error) {
 	if len(termArrList) == 0 {
 		return nil, nil
 	}
@@ -763,7 +831,8 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 	}
 
 	dataMap := se.DataMap
-	groups := make([][]map[uint32]int, len(termArrList))
+
+	groups := make([][]postingCandidate, len(termArrList))
 	groupSizes := make([]int, len(termArrList))
 
 	for i, terms := range termArrList {
@@ -771,12 +840,15 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 			return nil, nil
 		}
 
-		group := make([]map[uint32]int, 0, len(terms))
+		group := make([]postingCandidate, 0, len(terms))
 		sizeSum := 0
 
-		for _, term := range terms {
-			if m := dataMap[term]; m != nil {
-				group = append(group, m)
+		for _, cand := range terms {
+			if m := dataMap[cand.term]; m != nil {
+				group = append(group, postingCandidate{
+					m:     m,
+					boost: cand.boost,
+				})
 				sizeSum += len(m)
 			}
 		}
@@ -789,7 +861,6 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 		groupSizes[i] = sizeSum
 	}
 
-	// Anchor on the smallest group — fewest candidates to enumerate.
 	anchorIdx := 0
 	anchorSize := groupSizes[0]
 	for i := 1; i < len(groupSizes); i++ {
@@ -798,10 +869,9 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 			anchorIdx = i
 		}
 	}
+
 	anchorGroup := groups[anchorIdx]
 
-	// Dedup is only needed when the anchor group has multiple posting maps
-	// (synonyms can overlap on the same docID). One map = no overlap possible.
 	var visited map[uint32]struct{}
 	if len(anchorGroup) > 1 {
 		visited = make(map[uint32]struct{}, anchorSize)
@@ -811,14 +881,16 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 	h := make([]internalHit, 0, k)
 
 	scanned := 0
-	for _, anchorMap := range anchorGroup {
-		for internalID, score := range anchorMap {
+
+	for _, anchor := range anchorGroup {
+		for internalID, score := range anchor.m {
 			scanned++
 			if scanned%1024 == 0 {
 				if err := ctx.Err(); err != nil {
 					return nil, ErrSearchCanceled
 				}
 			}
+
 			if visited != nil {
 				if _, seen := visited[internalID]; seen {
 					continue
@@ -829,11 +901,12 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 			if deleted[internalID] {
 				continue
 			}
+
 			if allowed != nil && !filterBitTest(allowed, internalID) {
 				continue
 			}
 
-			total := score
+			total := score * anchor.boost
 			valid := true
 
 			for gi, group := range groups {
@@ -842,9 +915,10 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 				}
 
 				found := false
-				for _, m := range group {
-					if s, ok := m[internalID]; ok {
-						total += s
+
+				for _, cand := range group {
+					if s, ok := cand.m[internalID]; ok {
+						total += s * cand.boost
 						found = true
 						break
 					}
@@ -861,7 +935,6 @@ func (se *SearchEngine) MultiTermSearchLoop(ctx context.Context, termArrList [][
 			}
 
 			if len(h) < k {
-				// TODO: term based boost can be added here. example: if category:outdoor -> increase score
 				h = heapPushHit(h, internalHit{id: internalID, score: total})
 				if SkipWholeScan && len(h) >= k {
 					goto BreakLoop
@@ -881,18 +954,21 @@ BreakLoop:
 	extMap := se.InternalToExternal
 	docs := se.Documents
 	out := make([]ReturnedDocument, n)
+
 	for i := n - 1; i >= 0; i-- {
 		hit := h[0]
 		if i > 0 {
 			h[0] = h[i]
 			siftDownHit(h, 0, i)
 		}
+
 		out[i] = ReturnedDocument{
 			ID:    extMap[hit.id],
 			Data:  docs[hit.id],
 			Score: hit.score,
 		}
 	}
+
 	return out, nil
 }
 
@@ -1016,7 +1092,6 @@ func (se *SearchEngine) Search(query string, filters map[string][]interface{}) *
 }
 
 func (se *SearchEngine) SearchContext(ctx context.Context, query string, filters map[string][]interface{}) (*SearchResult, error) {
-	// TODO: Send raw query into search functions to be able to boost exact match more.
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil, nil
@@ -1027,107 +1102,155 @@ func (se *SearchEngine) SearchContext(ctx context.Context, query string, filters
 	}
 }
 
-func (se *SearchEngine) SingleTermSearch(ctx context.Context, queryTokens []string, filters map[string][]interface{}) (*SearchResult, error) {
-	parsedQuery := make(map[string][]string)
-	// TODO: make it var in the engine definition
+func (se *SearchEngine) SingleTermSearch(
+	ctx context.Context,
+	queryTokens []string,
+	filters map[string][]interface{},
+) (*SearchResult, error) {
+	if len(queryTokens) == 0 {
+		return &SearchResult{}, nil
+	}
+
+	query := queryTokens[0]
+
+	// TODO: make these configurable in SearchEngine.
 	maxPrefixTokens := 3
 	maxFuzzyTokens := 3
 
-	_, exactExists := se.termSet.Load(queryTokens[0])
+	candidates := make([]termCandidate, 0, 1+maxPrefixTokens+maxFuzzyTokens)
+
+	_, exactExists := se.termSet.Load(query)
+
 	se.mu.RLock()
-	prefixTokens := append([]string(nil), se.Prefix[queryTokens[0]]...)
-	var fuzzyWords []string
-	if len(prefixTokens) == 0 && !exactExists {
-		fuzzyWords = se.Symspell.FuzzySearch(queryTokens[0], maxFuzzyTokens)
-	}
-	se.mu.RUnlock()
+
+	prefixTokens := append([]string(nil), se.Prefix[query]...)
 	if len(prefixTokens) > maxPrefixTokens {
 		prefixTokens = prefixTokens[:maxPrefixTokens]
 	}
 
-	guessArr := prefixTokens
-
-	if len(guessArr) > 0 {
-		parsedQuery["prefix"] = append(parsedQuery["prefix"], guessArr...)
-	} else if len(fuzzyWords) > 0 {
-		parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], fuzzyWords...)
+	var fuzzyWords []string
+	if len(prefixTokens) == 0 && !exactExists {
+		fuzzyWords = se.Symspell.FuzzySearch(query, maxFuzzyTokens)
 	}
 
-	var finalDocs []ReturnedDocument
+	se.mu.RUnlock()
+
+	seen := make(map[string]struct{}, 1+len(prefixTokens)+len(fuzzyWords))
+
 	if exactExists {
-		docs, err := se.SingleTermSearchLoop(ctx, queryTokens[0], filters)
-		if err != nil {
-			return nil, err
-		}
-		finalDocs = append(finalDocs, docs...)
-	}
-	if parsedQuery["prefix"] != nil {
-		for _, q := range parsedQuery["prefix"] {
-			docs, err := se.SingleTermSearchLoop(ctx, q, filters)
-			if err != nil {
-				return nil, err
-			}
-			finalDocs = append(finalDocs, docs...)
-		}
-		limit := se.ResultSize
-		if len(finalDocs) < limit {
-			limit = len(finalDocs)
-		}
-		return &SearchResult{Docs: finalDocs[0:limit]}, nil
-	}
-	if parsedQuery["fuzzy"] != nil {
-		for _, q := range parsedQuery["fuzzy"] {
-			docs, err := se.SingleTermSearchLoop(ctx, q, filters)
-			if err != nil {
-				return nil, err
-			}
-			finalDocs = append(finalDocs, docs...)
-		}
-		limit := se.ResultSize
-		if len(finalDocs) < limit {
-			limit = len(finalDocs)
-		}
-		return &SearchResult{Docs: finalDocs[0:limit]}, nil
+		candidates = append(candidates, termCandidate{
+			term:  query,
+			boost: ExactMatchBoost,
+		})
+		seen[query] = struct{}{}
 	}
 
-	limit := se.ResultSize
-	if len(finalDocs) < limit {
-		limit = len(finalDocs)
+	if len(prefixTokens) > 0 {
+		for _, term := range prefixTokens {
+			if _, ok := seen[term]; ok {
+				continue
+			}
+
+			candidates = append(candidates, termCandidate{
+				term:  term,
+				boost: 1,
+			})
+			seen[term] = struct{}{}
+		}
+	} else if len(fuzzyWords) > 0 {
+		for _, term := range fuzzyWords {
+			if _, ok := seen[term]; ok {
+				continue
+			}
+
+			candidates = append(candidates, termCandidate{
+				term:  term,
+				boost: 1,
+			})
+			seen[term] = struct{}{}
+		}
 	}
-	return &SearchResult{Docs: finalDocs[0:limit]}, nil
+
+	docs, err := se.SingleTermSearchLoop(ctx, candidates, filters)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SearchResult{Docs: docs}, nil
 }
 
-func (se *SearchEngine) MultiTermSearch(ctx context.Context, queryTokens []string, filters map[string][]interface{}) (*SearchResult, error) {
+func (se *SearchEngine) MultiTermSearch(
+	ctx context.Context,
+	queryTokens []string,
+	filters map[string][]interface{},
+) (*SearchResult, error) {
+	if len(queryTokens) == 0 {
+		return &SearchResult{}, nil
+	}
+
 	lastQueryIndex := len(queryTokens) - 1
 	rawFirstTerms := queryTokens[:lastQueryIndex]
 	rawLastTerm := queryTokens[lastQueryIndex]
 
-	termArrList := make([][]string, len(queryTokens))
+	termArrList := make([][]termCandidate, len(queryTokens))
 
 	_, lastExists := se.termSet.Load(rawLastTerm)
+
 	se.mu.RLock()
+
 	maxPrefix := prefixLimitForQuery(rawLastTerm)
 	if len(se.Prefix[rawLastTerm]) < maxPrefix {
 		maxPrefix = len(se.Prefix[rawLastTerm])
 	}
+
 	lastTermGuessArr := append([]string(nil), se.Prefix[rawLastTerm][:maxPrefix]...)
+
 	for k, firstTerm := range rawFirstTerms {
 		if _, ok := se.termSet.Load(firstTerm); ok {
-			termArrList[k] = []string{firstTerm}
+			termArrList[k] = append(termArrList[k], termCandidate{
+				term:  firstTerm,
+				boost: ExactMatchBoost,
+			})
 		}
-		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, fuzzyLimitForQuery(firstTerm))...)
+
+		for _, fuzzy := range se.Symspell.FuzzySearch(firstTerm, fuzzyLimitForQuery(firstTerm)) {
+			// Avoid adding duplicate exact term as fuzzy result.
+			if fuzzy == firstTerm {
+				continue
+			}
+
+			termArrList[k] = append(termArrList[k], termCandidate{
+				term:  fuzzy,
+				boost: 1,
+			})
+		}
 	}
+
 	se.mu.RUnlock()
 
 	if lastExists {
-		termArrList[lastQueryIndex] = []string{rawLastTerm}
+		termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], termCandidate{
+			term:  rawLastTerm,
+			boost: ExactMatchBoost,
+		})
 	}
-	termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], lastTermGuessArr...)
+
+	for _, guess := range lastTermGuessArr {
+		if guess == rawLastTerm {
+			continue
+		}
+
+		termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], termCandidate{
+			term:  guess,
+			boost: 1,
+		})
+	}
 
 	docs, err := se.MultiTermSearchLoop(ctx, termArrList, filters)
 	if err != nil {
 		return nil, err
 	}
+
 	return &SearchResult{Docs: docs}, nil
 }
 

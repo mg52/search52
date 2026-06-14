@@ -2,7 +2,6 @@ package handler
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -35,13 +34,13 @@ func assertEngineSearchIDs(t *testing.T, docs []engine.ReturnedDocument, exp ...
 	}
 }
 
-func mustSingleTermSearchLoop(t *testing.T, se *engine.SearchEngine, query string, filters map[string][]interface{}) []engine.ReturnedDocument {
+func mustEngineSearch(t *testing.T, se *engine.SearchEngine, query string, filters map[string][]interface{}) []engine.ReturnedDocument {
 	t.Helper()
-	docs, err := se.SingleTermSearchLoop(context.Background(), query, filters)
-	if err != nil {
-		t.Fatalf("SingleTermSearchLoop(%q): %v", query, err)
+	res := se.Search(query, filters)
+	if res == nil {
+		return nil
 	}
-	return docs
+	return res.Docs
 }
 
 func TestCreateIndexHandler(t *testing.T) {
@@ -393,8 +392,8 @@ func TestLoadEngine_Success(t *testing.T) {
 	if loaded.FieldWeights["name"] != 3 || loaded.FieldWeights["tags"] != 1 {
 		t.Fatalf("expected restored field weights, got %+v", loaded.FieldWeights)
 	}
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, loaded, "sunny", nil), "1")
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, loaded, "sunny", map[string][]interface{}{"year": {"2020"}}), "1")
+	assertEngineSearchIDs(t, mustEngineSearch(t, loaded, "sunny", nil), "1")
+	assertEngineSearchIDs(t, mustEngineSearch(t, loaded, "sunny", map[string][]interface{}{"year": {"2020"}}), "1")
 }
 
 func TestLoadEngine_CorruptPayloadKeepsExistingIndex(t *testing.T) {
@@ -425,7 +424,7 @@ func TestLoadEngine_CorruptPayloadKeepsExistingIndex(t *testing.T) {
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d body=%s", rr.Code, rr.Body.String())
 	}
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, h.engines["idx"], "kept", nil), "existing")
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "kept", nil), "existing")
 }
 
 func TestSearchHandler_Errors(t *testing.T) {
@@ -612,8 +611,8 @@ func TestAddToIndexHandler_JSONSuccess(t *testing.T) {
 	if resp.AddedCount != 2 || resp.TotalDocs != 2 {
 		t.Fatalf("unexpected add response: %+v", resp)
 	}
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, h.engines["idx"], "sunny", nil), "1")
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, h.engines["idx"], "cloudy", nil), "2")
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "sunny", nil), "1")
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "cloudy", nil), "2")
 }
 
 func TestAddToIndexHandler_CSVSuccess(t *testing.T) {
@@ -646,7 +645,7 @@ func TestAddToIndexHandler_CSVSuccess(t *testing.T) {
 	if resp.AddedCount != 2 || resp.TotalDocs != 2 {
 		t.Fatalf("unexpected add response: %+v", resp)
 	}
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, h.engines["idx"], "rio", nil), "1")
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "rio", nil), "1")
 }
 
 func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
@@ -775,9 +774,9 @@ func TestCompactIndexHandler(t *testing.T) {
 	if resp.Stats.BeforeStored != 3 || resp.Stats.AfterStored != 1 || resp.Stats.RemovedVersions != 2 {
 		t.Fatalf("unexpected compact stats: %+v", resp.Stats)
 	}
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, h.engines["idx"], "new", nil), "1")
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, h.engines["idx"], "old", nil))
-	assertEngineSearchIDs(t, mustSingleTermSearchLoop(t, h.engines["idx"], "delete", nil))
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "new", nil), "1")
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "old", nil))
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "delete", nil))
 }
 
 func TestDocumentEndpoints_E2E_AddUpdateDeleteSearch(t *testing.T) {

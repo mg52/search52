@@ -125,6 +125,31 @@ func TestSingleTermSearchLoopDeleted(t *testing.T) {
 	}
 }
 
+func TestSingleTermSearchBoostsExactMatchOverPrefixCandidate(t *testing.T) {
+	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se.Index([]map[string]interface{}{
+		{"id": "exact", "title": "pro"},
+		{"id": "prefix", "title": "project"},
+	})
+
+	res := se.Search("pro", nil)
+	if res == nil {
+		t.Fatalf("Search returned nil")
+	}
+	if len(res.Docs) != 2 {
+		t.Fatalf("expected exact and prefix results, got %d: %+v", len(res.Docs), res.Docs)
+	}
+	if res.Docs[0].ID != "exact" {
+		t.Fatalf("expected exact match first, got %+v", res.Docs)
+	}
+	if res.Docs[0].Score != 200000 {
+		t.Fatalf("expected exact score to be boosted to 200000, got %+v", res.Docs[0])
+	}
+	if res.Docs[1].ID != "prefix" || res.Docs[1].Score != 100000 {
+		t.Fatalf("expected unboosted prefix candidate second, got %+v", res.Docs[1])
+	}
+}
+
 func TestSearchMultiTermAND_OR(t *testing.T) {
 	se := newTestEngineForMultiTerm()
 
@@ -133,7 +158,7 @@ func TestSearchMultiTermAND_OR(t *testing.T) {
 		{"iphone", "phone", "phona"},
 	}
 
-	res, err := se.MultiTermSearchLoop(context.Background(), terms, nil)
+	res, err := se.MultiTermSearchLoop(context.Background(), termCandidateGroups(terms), nil)
 	if err != nil {
 		t.Fatalf("MultiTermSearchLoop: %v", err)
 	}
@@ -150,6 +175,31 @@ func TestSearchMultiTermAND_OR(t *testing.T) {
 	}
 }
 
+func TestMultiTermSearchBoostsExactMatchOverPrefixCandidate(t *testing.T) {
+	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se.Index([]map[string]interface{}{
+		{"id": "exact", "title": "apple phone"},
+		{"id": "prefix", "title": "apple phonecase"},
+	})
+
+	res := se.Search("apple phone", nil)
+	if res == nil {
+		t.Fatalf("Search returned nil")
+	}
+	if len(res.Docs) != 2 {
+		t.Fatalf("expected exact and prefix results, got %d: %+v", len(res.Docs), res.Docs)
+	}
+	if res.Docs[0].ID != "exact" {
+		t.Fatalf("expected exact last-term match first, got %+v", res.Docs)
+	}
+	if res.Docs[0].Score != 200000 {
+		t.Fatalf("expected exact multi-term score to be boosted to 200000, got %+v", res.Docs[0])
+	}
+	if res.Docs[1].ID != "prefix" || res.Docs[1].Score != 150000 {
+		t.Fatalf("expected prefix candidate to keep only first-term exact boost, got %+v", res.Docs[1])
+	}
+}
+
 func TestSearchMultiTermScoreAggregation(t *testing.T) {
 	se := newTestEngine()
 
@@ -158,7 +208,7 @@ func TestSearchMultiTermScoreAggregation(t *testing.T) {
 		{"iphone"},
 	}
 
-	res, err := se.MultiTermSearchLoop(context.Background(), terms, nil)
+	res, err := se.MultiTermSearchLoop(context.Background(), termCandidateGroups(terms), nil)
 	if err != nil {
 		t.Fatalf("MultiTermSearchLoop: %v", err)
 	}
@@ -178,7 +228,7 @@ func TestSearchMultiTermScoreAggregation(t *testing.T) {
 func TestSearchMultiTermEmpty(t *testing.T) {
 	se := newTestEngine()
 
-	res, err := se.MultiTermSearchLoop(context.Background(), [][]string{{"nonexistent"}}, nil)
+	res, err := se.MultiTermSearchLoop(context.Background(), termCandidateGroups([][]string{{"nonexistent"}}), nil)
 	if err != nil {
 		t.Fatalf("MultiTermSearchLoop: %v", err)
 	}
@@ -225,11 +275,22 @@ func assertIDs(t *testing.T, got []ReturnedDocument, expIDs ...string) {
 
 func mustSingleTermSearchLoop(t *testing.T, se *SearchEngine, query string, filters map[string][]interface{}) []ReturnedDocument {
 	t.Helper()
-	docs, err := se.SingleTermSearchLoop(context.Background(), query, filters)
+	docs, err := se.SingleTermSearchLoop(context.Background(), []termCandidate{{term: query, boost: 1}}, filters)
 	if err != nil {
 		t.Fatalf("SingleTermSearchLoop(%q): %v", query, err)
 	}
 	return docs
+}
+
+func termCandidateGroups(groups [][]string) [][]termCandidate {
+	out := make([][]termCandidate, len(groups))
+	for i, group := range groups {
+		out[i] = make([]termCandidate, len(group))
+		for j, term := range group {
+			out[i][j] = termCandidate{term: term, boost: 1}
+		}
+	}
+	return out
 }
 
 func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
