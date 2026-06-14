@@ -40,11 +40,11 @@ The load-test client drains each response body before recording latency.
 
 | Scope | Workers | Queries | Errors | Client errors | HTTP statuses | Wall time | RPS | avg | p50 | p95 | p99 |
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| Overall | 16 | 100000 | 0 | 0 | {200:100000} | 20.703s | 4830.3 | 3.29ms | 1.20ms | 9.48ms | 32.54ms |
-| Single / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 20.703s | 1207.6 | 4.84ms | 1.32ms | 13.67ms | 54.30ms |
-| Single / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 20.703s | 1207.6 | 3.94ms | 0.92ms | 12.63ms | 55.88ms |
-| Multi / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 20.703s | 1207.6 | 2.33ms | 1.35ms | 6.77ms | 18.10ms |
-| Multi / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 20.703s | 1207.6 | 2.05ms | 1.20ms | 6.15ms | 15.74ms |
+| Overall | 16 | 100000 | 0 | 0 | {200:100000} | 1m3.425s | 1576.7 | 10.12ms | 4.62ms | 32.03ms | 90.71ms |
+| Single / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.96ms | 4.30ms | 24.96ms | 54.66ms |
+| Single / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.70ms | 3.51ms | 24.38ms | 60.46ms |
+| Multi / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 16.89ms | 6.60ms | 58.06ms | 177.62ms |
+| Multi / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.94ms | 4.24ms | 26.09ms | 53.91ms |
 
 ### In-process benchmark
 
