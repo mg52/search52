@@ -1,7 +1,7 @@
 ############################
 # 1) Build stage
 ############################
-FROM golang:1.25.4-alpine AS builder
+FROM golang:1.26.4-alpine AS builder
 
 # Install git for module fetches
 RUN apk add --no-cache git
