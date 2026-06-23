@@ -126,13 +126,13 @@ func TestSingleTermSearchLoopDeleted(t *testing.T) {
 }
 
 func TestSingleTermSearchBoostsExactMatchOverPrefixCandidate(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 	se.Index([]map[string]interface{}{
 		{"id": "exact", "title": "pro"},
 		{"id": "prefix", "title": "project"},
 	})
 
-	res := se.Search("pro", nil)
+	res, _ := se.Search(context.Background(), "pro", nil)
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -176,13 +176,13 @@ func TestSearchMultiTermAND_OR(t *testing.T) {
 }
 
 func TestMultiTermSearchBoostsExactMatchOverPrefixCandidate(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 	se.Index([]map[string]interface{}{
 		{"id": "exact", "title": "apple phone"},
 		{"id": "prefix", "title": "apple phonecase"},
 	})
 
-	res := se.Search("apple phone", nil)
+	res, _ := se.Search(context.Background(), "apple phone", nil)
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -242,6 +242,7 @@ func newTestEngineForE2E() *SearchEngine {
 	// filters: which doc fields are indexed into FilterDocs ("field:value")
 	return NewSearchEngine(
 		[]string{"title"},
+		nil,
 		map[string]bool{"genre": true},
 		10, // return size
 	)
@@ -375,7 +376,7 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 
 	// 6) E2E via Search() as well (single term path)
 	// (Uses prefix/fuzzy expansion internally, but for these exact terms it should include the same docs.)
-	res := se.Search("sunny", nil)
+	res, _ := se.Search(context.Background(), "sunny", nil)
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -386,7 +387,7 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 	filters := map[string][]interface{}{
 		"genre": {"pop"},
 	}
-	res = se.Search("sunny", filters)
+	res, _ = se.Search(context.Background(), "sunny", filters)
 	if res == nil {
 		t.Fatalf("Search (filtered) returned nil")
 	}
@@ -409,6 +410,7 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 	// 1) Build engine + mutate state (add/update/delete)
 	se := NewSearchEngine(
 		[]string{"name"},
+		nil,
 		map[string]bool{"year": true},
 		10,
 	)
@@ -541,6 +543,7 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 func TestMultiTermSearch_E2E(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title", "tags"},      // indexed fields
+		nil,
 		map[string]bool{"genre": true}, // filters
 		10,
 	)
@@ -591,7 +594,7 @@ func TestMultiTermSearch_E2E(t *testing.T) {
 	// - doc4: "Apple Banana" -> excluded (no phone)
 	// - doc3: "Samsung Phone" -> excluded (no apple)
 
-	res := se.Search("apple phone", nil)
+	res, _ := se.Search(context.Background(), "apple phone", nil)
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -604,7 +607,7 @@ func TestMultiTermSearch_E2E(t *testing.T) {
 		"genre": {"tech"},
 	}
 
-	res = se.Search("apple phone", filters)
+	res, _ = se.Search(context.Background(), "apple phone", filters)
 	if res == nil {
 		t.Fatalf("Filtered search returned nil")
 	}
@@ -617,7 +620,7 @@ func TestMultiTermSearch_E2E(t *testing.T) {
 		"genre": {"food"},
 	}
 
-	res = se.Search("apple phone", filters)
+	res, _ = se.Search(context.Background(), "apple phone", filters)
 	if res == nil {
 		t.Fatalf("Filtered search returned nil")
 	}
@@ -628,6 +631,7 @@ func TestMultiTermSearch_E2E(t *testing.T) {
 func TestMultiTermSearch_E2E_WithScoringOrder(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title", "tags"},
+		nil,
 		map[string]bool{"genre": true},
 		10,
 	)
@@ -674,7 +678,7 @@ func TestMultiTermSearch_E2E_WithScoringOrder(t *testing.T) {
 	// 2) Multi-term search
 	// appre -> system will fuzzy fix it as apple
 	// pho -> system will find the word phone for prefix pho
-	res := se.Search("appre pho", nil)
+	res, _ := se.Search(context.Background(), "appre pho", nil)
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -707,6 +711,7 @@ func TestMultiTermSearch_E2E_WithScoringOrder(t *testing.T) {
 func TestSingleTermSearch_E2E_WithScoringOrder(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title", "description"},
+		nil,
 		map[string]bool{"category": true},
 		10,
 	)
@@ -738,7 +743,7 @@ func TestSingleTermSearch_E2E_WithScoringOrder(t *testing.T) {
 		}
 	}
 
-	res := se.Search("caffee", nil)
+	res, _ := se.Search(context.Background(), "caffee", nil)
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -771,6 +776,7 @@ func TestSingleTermSearch_E2E_WithScoringOrder(t *testing.T) {
 func Test_E2E(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title", "description"},
+		nil,
 		map[string]bool{"category": true},
 		5,
 	)
@@ -910,7 +916,7 @@ func Test_E2E(t *testing.T) {
 		}
 	}
 
-	res := se.Search("caffee", nil)
+	res, _ := se.Search(context.Background(), "caffee", nil)
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -927,7 +933,7 @@ func Test_E2E(t *testing.T) {
 }
 
 func TestWeightedFields_SearchUpdateDelete_E2E(t *testing.T) {
-	se := NewSearchEngineWithFieldWeights(
+	se := NewSearchEngine(
 		[]string{"title", "description"},
 		map[string]int{"title": 5, "description": 1},
 		map[string]bool{"category": true},
@@ -957,7 +963,7 @@ func TestWeightedFields_SearchUpdateDelete_E2E(t *testing.T) {
 
 	se.Index(docs)
 
-	res := se.Search("blue", map[string][]interface{}{"category": {"music"}})
+	res, _ := se.Search(context.Background(), "blue", map[string][]interface{}{"category": {"music"}})
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -980,7 +986,7 @@ func TestWeightedFields_SearchUpdateDelete_E2E(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument weighted update: %v", err)
 	}
 
-	res = se.Search("blue", map[string][]interface{}{"category": {"music"}})
+	res, _ = se.Search(context.Background(), "blue", map[string][]interface{}{"category": {"music"}})
 	if res == nil {
 		t.Fatalf("Search after update returned nil")
 	}
@@ -995,13 +1001,13 @@ func TestWeightedFields_SearchUpdateDelete_E2E(t *testing.T) {
 		t.Fatalf("DeleteDocument(description-hit) expected true")
 	}
 
-	res = se.Search("blue", map[string][]interface{}{"category": {"music"}})
+	res, _ = se.Search(context.Background(), "blue", map[string][]interface{}{"category": {"music"}})
 	if res == nil {
 		t.Fatalf("Search after delete returned nil")
 	}
 	assertIDs(t, res.Docs, "title-hit")
 
-	res = se.Search("blue", map[string][]interface{}{"category": {"book"}})
+	res, _ = se.Search(context.Background(), "blue", map[string][]interface{}{"category": {"book"}})
 	if res == nil {
 		t.Fatalf("Search with book filter returned nil")
 	}
@@ -1009,7 +1015,7 @@ func TestWeightedFields_SearchUpdateDelete_E2E(t *testing.T) {
 }
 
 func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
-	se := NewSearchEngineWithFieldWeights(
+	se := NewSearchEngine(
 		[]string{"title", "artist", "album"},
 		map[string]int{"title": 6, "artist": 3, "album": 1},
 		map[string]bool{"kind": true},
@@ -1049,7 +1055,7 @@ func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
 
 	se.Index(docs)
 
-	res := se.Search("iron", map[string][]interface{}{"kind": {"track"}})
+	res, _ := se.Search(context.Background(), "iron", map[string][]interface{}{"kind": {"track"}})
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -1064,7 +1070,7 @@ func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
 		}
 	}
 
-	multi := se.Search("iron mai", map[string][]interface{}{"kind": {"track"}})
+	multi, _ := se.Search(context.Background(), "iron mai", map[string][]interface{}{"kind": {"track"}})
 	if multi == nil {
 		t.Fatalf("Multi-term Search returned nil")
 	}
@@ -1090,7 +1096,7 @@ func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
 		t.Fatalf("field weights were not restored: %+v", loaded.FieldWeights)
 	}
 
-	res = loaded.Search("iron", map[string][]interface{}{"kind": {"track"}})
+	res, _ = loaded.Search(context.Background(), "iron", map[string][]interface{}{"kind": {"track"}})
 	if res == nil {
 		t.Fatalf("loaded Search returned nil")
 	}
@@ -1103,7 +1109,7 @@ func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
 		}
 	}
 
-	filtered := loaded.Search("iron", map[string][]interface{}{"kind": {"podcast"}})
+	filtered, _ := loaded.Search(context.Background(), "iron", map[string][]interface{}{"kind": {"podcast"}})
 	if filtered == nil {
 		t.Fatalf("loaded filtered Search returned nil")
 	}
@@ -1113,6 +1119,7 @@ func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
 func TestIndex_MultipleBatches(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title", "tags"},
+		nil,
 		map[string]bool{"genre": true},
 		10,
 	)
@@ -1167,7 +1174,7 @@ func TestIndex_MultipleBatches(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		res := se.Search(tt.query, nil)
+		res, _ := se.Search(context.Background(), tt.query, nil)
 
 		if res == nil {
 			t.Fatalf("search returned nil for query %q", tt.query)
@@ -1197,6 +1204,7 @@ func TestIndex_MultipleBatches(t *testing.T) {
 func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title"},
+		nil,
 		map[string]bool{"year": true},
 		10,
 	)
@@ -1219,7 +1227,7 @@ func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
 	}
 
 	// SearchContext: exact single-term match via termSet
-	res, err := loaded.SearchContext(context.Background(), "golden", nil)
+	res, err := loaded.Search(context.Background(), "golden", nil)
 	if err != nil {
 		t.Fatalf("SearchContext('golden'): %v", err)
 	}
@@ -1235,7 +1243,7 @@ func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
 	}
 
 	// SearchContext: prefix match (term not exact, relies on Prefix rebuild)
-	resPrefix, err := loaded.SearchContext(context.Background(), "brid", nil)
+	resPrefix, err := loaded.Search(context.Background(), "brid", nil)
 	if err != nil {
 		t.Fatalf("SearchContext('brid'): %v", err)
 	}
@@ -1244,7 +1252,7 @@ func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
 	}
 
 	// SearchContext: single-term with filter
-	resFiltered, err := loaded.SearchContext(context.Background(), "golden", map[string][]interface{}{"year": {"2021"}})
+	resFiltered, err := loaded.Search(context.Background(), "golden", map[string][]interface{}{"year": {"2021"}})
 	if err != nil {
 		t.Fatalf("SearchContext('golden', filter): %v", err)
 	}
@@ -1253,7 +1261,7 @@ func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
 	}
 
 	// SearchContext: both terms must appear
-	resMulti, err := loaded.SearchContext(context.Background(), "golden bridge", nil)
+	resMulti, err := loaded.Search(context.Background(), "golden bridge", nil)
 	if err != nil {
 		t.Fatalf("SearchContext('golden bridge'): %v", err)
 	}
@@ -1265,7 +1273,7 @@ func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
 	}
 
 	// SearchContext: multi-term with filter
-	resMultiFiltered, err := loaded.SearchContext(context.Background(), "golden bridge", map[string][]interface{}{"year": {"2020"}})
+	resMultiFiltered, err := loaded.Search(context.Background(), "golden bridge", map[string][]interface{}{"year": {"2020"}})
 	if err != nil {
 		t.Fatalf("SearchContext('golden bridge', filter): %v", err)
 	}
@@ -1279,6 +1287,7 @@ func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
 func TestSaveLoad_BulkIndexPath(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"name", "tags"},
+		nil,
 		map[string]bool{"category": true},
 		10,
 	)
@@ -1325,7 +1334,7 @@ func TestSaveLoad_BulkIndexPath(t *testing.T) {
 	}
 
 	// termSet populated: SearchContext single-term path works
-	singleRes, err := loaded.SearchContext(context.Background(), "calm", nil)
+	singleRes, err := loaded.Search(context.Background(), "calm", nil)
 	if err != nil {
 		t.Fatalf("SearchContext('calm'): %v", err)
 	}
@@ -1346,7 +1355,7 @@ func TestSaveLoad_BulkIndexPath(t *testing.T) {
 }
 
 func TestCompactDeleted_RebuildsCurrentIndexOnly(t *testing.T) {
-	se := NewSearchEngineWithFieldWeights(
+	se := NewSearchEngine(
 		[]string{"title", "artist"},
 		map[string]int{"title": 3, "artist": 1},
 		map[string]bool{"year": true},
@@ -1405,7 +1414,7 @@ func TestUpdatePrefixOrdersByActiveDocFrequencyAndDropsDeletedTerms(t *testing.T
 		t.Skip("UpdatePrefix ordering is disabled by SkipUpdatePrefix")
 	}
 
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	docs := []map[string]interface{}{
 		{"id": "1", "title": "pearl"},
@@ -1456,7 +1465,7 @@ func TestUpdatePrefixOrdersByActiveDocFrequencyAndDropsDeletedTerms2(t *testing.
 		t.Skip("UpdatePrefix ordering is disabled by SkipUpdatePrefix")
 	}
 
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	docs := []map[string]interface{}{
 		{"id": "1", "title": "pearl"},
@@ -1526,7 +1535,7 @@ func TestUpdatePrefixOrdersByActiveDocFrequencyAndDropsDeletedTerms2(t *testing.
 }
 
 func TestSearchContextCanceled(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "title": "cancelable query"}); err != nil {
 		t.Fatalf("AddOrUpdateDocument: %v", err)
 	}
@@ -1534,14 +1543,14 @@ func TestSearchContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := se.SearchContext(ctx, "cancelable", nil)
+	_, err := se.Search(ctx, "cancelable", nil)
 	if !errors.Is(err, ErrSearchCanceled) {
 		t.Fatalf("expected ErrSearchCanceled, got %v", err)
 	}
 }
 
 func TestFilterFieldsReturnsCopy(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"year": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"year": true}, 10)
 
 	filters := se.FilterFields()
 	filters["year"] = false
@@ -1559,6 +1568,7 @@ func TestFilterFieldsReturnsCopy(t *testing.T) {
 func TestArrayFilterValuesAreIndexed(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"name", "category", "description"},
+		nil,
 		map[string]bool{"category": true},
 		10,
 	)
@@ -1578,12 +1588,12 @@ func TestArrayFilterValuesAreIndexed(t *testing.T) {
 		},
 	})
 
-	res := se.Search("ringbarks", map[string][]interface{}{"category": {"tea"}})
+	res, _ := se.Search(context.Background(), "ringbarks", map[string][]interface{}{"category": {"tea"}})
 	if len(res.Docs) == 0 || res.Docs[0].ID != "p24" {
 		t.Fatalf("expected p24 for category:tea filter, got %+v", res.Docs)
 	}
 
-	res = se.Search("ringbarks", map[string][]interface{}{"category": {"coffee"}})
+	res, _ = se.Search(context.Background(), "ringbarks", map[string][]interface{}{"category": {"coffee"}})
 	if len(res.Docs) == 0 || res.Docs[0].ID != "p25" {
 		t.Fatalf("expected p25 for category:coffee filter, got %+v", res.Docs)
 	}
@@ -1592,6 +1602,7 @@ func TestArrayFilterValuesAreIndexed(t *testing.T) {
 func TestNumericYearFilterValuesAreIndexed(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title", "description"},
+		nil,
 		map[string]bool{"year": true},
 		10,
 	)
@@ -1617,17 +1628,17 @@ func TestNumericYearFilterValuesAreIndexed(t *testing.T) {
 		},
 	})
 
-	res := se.Search("ceramic", map[string][]interface{}{"year": {"2024"}})
+	res, _ := se.Search(context.Background(), "ceramic", map[string][]interface{}{"year": {"2024"}})
 	if len(res.Docs) != 1 || res.Docs[0].ID != "int-year" {
 		t.Fatalf("expected int-year for year:2024 filter, got %+v", res.Docs)
 	}
 
-	res = se.Search("ceramic", map[string][]interface{}{"year": {"2025"}})
+	res, _ = se.Search(context.Background(), "ceramic", map[string][]interface{}{"year": {"2025"}})
 	if len(res.Docs) != 1 || res.Docs[0].ID != "float-year" {
 		t.Fatalf("expected float-year for year:2025 filter, got %+v", res.Docs)
 	}
 
-	res = se.Search("ceramic", map[string][]interface{}{"year": {"2024", "2025"}})
+	res, _ = se.Search(context.Background(), "ceramic", map[string][]interface{}{"year": {"2024", "2025"}})
 	if len(res.Docs) != 2 {
 		t.Fatalf("expected two docs for year:2024 OR year:2025 filter, got %+v", res.Docs)
 	}
@@ -1636,7 +1647,7 @@ func TestNumericYearFilterValuesAreIndexed(t *testing.T) {
 		t.Fatalf("expected int-year and float-year, got %+v", res.Docs)
 	}
 
-	res = se.Search("ceramic", map[string][]interface{}{"year": {"2022"}})
+	res, _ = se.Search(context.Background(), "ceramic", map[string][]interface{}{"year": {"2022"}})
 	if len(res.Docs) != 0 {
 		t.Fatalf("expected no docs for year:2022 filter, got %+v", res.Docs)
 	}
@@ -1645,6 +1656,7 @@ func TestNumericYearFilterValuesAreIndexed(t *testing.T) {
 func TestSaveLoadRebuildsArrayAndNumericFilters(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"name", "category", "description"},
+		nil,
 		map[string]bool{"category": true, "year": true},
 		10,
 	)
@@ -1675,12 +1687,12 @@ func TestSaveLoadRebuildsArrayAndNumericFilters(t *testing.T) {
 		t.Fatalf("LoadAll: %v", err)
 	}
 
-	res := loaded.Search("ringbarks", map[string][]interface{}{"category": {"tea"}, "year": {"2024"}})
+	res, _ := loaded.Search(context.Background(), "ringbarks", map[string][]interface{}{"category": {"tea"}, "year": {"2024"}})
 	if len(res.Docs) != 1 || res.Docs[0].ID != "p24" {
 		t.Fatalf("expected p24 after load for category:tea year:2024, got %+v", res.Docs)
 	}
 
-	res = loaded.Search("ringbarks", map[string][]interface{}{"category": {"coffee"}, "year": {"2025"}})
+	res, _ = loaded.Search(context.Background(), "ringbarks", map[string][]interface{}{"category": {"coffee"}, "year": {"2025"}})
 	if len(res.Docs) != 1 || res.Docs[0].ID != "p25" {
 		t.Fatalf("expected p25 after load for category:coffee year:2025, got %+v", res.Docs)
 	}
@@ -1700,11 +1712,13 @@ func TestIndexBatchingMatchesSingleBatch(t *testing.T) {
 
 	oneShot := NewSearchEngine(
 		[]string{"name", "category", "description"},
+		nil,
 		map[string]bool{"category": true, "year": true},
 		25,
 	)
 	batched := NewSearchEngine(
 		[]string{"name", "category", "description"},
+		nil,
 		map[string]bool{"category": true, "year": true},
 		25,
 	)
@@ -1718,7 +1732,7 @@ func TestIndexBatchingMatchesSingleBatch(t *testing.T) {
 }
 
 func TestSaveAll_NoTempFileRemains(t *testing.T) {
-	se := NewSearchEngine([]string{"name"}, nil, 10)
+	se := NewSearchEngine([]string{"name"}, nil, nil, 10)
 	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "name": "hello world"}); err != nil {
 		t.Fatalf("AddOrUpdateDocument: %v", err)
 	}
@@ -1763,6 +1777,7 @@ func termSetSnapshot(se *SearchEngine) []string {
 func newTermSetEngine() *SearchEngine {
 	return NewSearchEngine(
 		[]string{"title", "artist"},
+		nil,
 		map[string]bool{"genre": true},
 		10,
 	)

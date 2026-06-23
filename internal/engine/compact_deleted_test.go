@@ -14,6 +14,7 @@ func newCompactSE(t *testing.T) *SearchEngine {
 	t.Helper()
 	return NewSearchEngine(
 		[]string{"title", "artist"},
+		nil,
 		map[string]bool{"genre": true, "year": true},
 		10,
 	)
@@ -231,7 +232,7 @@ func TestCompactDeleted_SingleTermSearchAfterCompact(t *testing.T) {
 }
 
 func TestCompactDeleted_MultiTermSearchAfterCompact(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	addDoc(t, se, map[string]interface{}{"id": "1", "title": "apple phone"})
 	addDoc(t, se, map[string]interface{}{"id": "2", "title": "apple tablet"})
@@ -241,7 +242,7 @@ func TestCompactDeleted_MultiTermSearchAfterCompact(t *testing.T) {
 
 	se.CompactDeleted()
 
-	res := se.Search("apple phone", nil)
+	res, _ := se.Search(context.Background(), "apple phone", nil)
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -264,7 +265,7 @@ func TestCompactDeleted_StringFilterAfterCompact(t *testing.T) {
 }
 
 func TestCompactDeleted_NumericFilterAfterCompact(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"year": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"year": true}, 10)
 
 	addDoc(t, se, map[string]interface{}{"id": "1", "title": "song", "year": 2020})
 	addDoc(t, se, map[string]interface{}{"id": "2", "title": "song", "year": 2021})
@@ -279,7 +280,7 @@ func TestCompactDeleted_NumericFilterAfterCompact(t *testing.T) {
 }
 
 func TestCompactDeleted_ArrayFilterAfterCompact(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"tags": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"tags": true}, 10)
 
 	addDoc(t, se, map[string]interface{}{
 		"id":    "1",
@@ -310,7 +311,7 @@ func TestCompactDeleted_PrefixOrderedByFrequency(t *testing.T) {
 	if SkipUpdatePrefix {
 		t.Skip("prefix ordering disabled")
 	}
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	// "pearl" in 3 docs, "peach" in 2 docs, "peanut" in 1 doc.
 	for i := 0; i < 3; i++ {
@@ -346,7 +347,7 @@ func TestCompactDeleted_PrefixOrderedByFrequency(t *testing.T) {
 }
 
 func TestCompactDeleted_PrefixDropsDeletedOnlyTerms(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	addDoc(t, se, map[string]interface{}{"id": "1", "title": "keep"})
 	addDoc(t, se, map[string]interface{}{"id": "2", "title": "kill"})
@@ -374,7 +375,7 @@ func TestCompactDeleted_PrefixDropsDeletedOnlyTerms(t *testing.T) {
 }
 
 func TestCompactDeleted_SymSpellRebuildAfterCompact(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	addDoc(t, se, map[string]interface{}{"id": "1", "title": "mountain"})
 	addDoc(t, se, map[string]interface{}{"id": "2", "title": "fountain"})
@@ -407,7 +408,7 @@ func TestCompactDeleted_SymSpellRebuildAfterCompact(t *testing.T) {
 }
 
 func TestCompactDeleted_TermSetAfterCompact(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	addDoc(t, se, map[string]interface{}{"id": "1", "title": "active"})
 	addDoc(t, se, map[string]interface{}{"id": "2", "title": "gone"})
@@ -519,7 +520,7 @@ func TestCompactDeleted_NoDeletions(t *testing.T) {
 }
 
 func TestCompactDeleted_MultipleVersionsOnlyLatestSurvives(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	// Update doc "1" three times.
 	addDoc(t, se, map[string]interface{}{"id": "1", "title": "version one"})
@@ -544,7 +545,7 @@ func TestCompactDeleted_MultipleVersionsOnlyLatestSurvives(t *testing.T) {
 }
 
 func TestCompactDeleted_WeightedFieldsPreservedAfterCompact(t *testing.T) {
-	se := NewSearchEngineWithFieldWeights(
+	se := NewSearchEngine(
 		[]string{"title", "description"},
 		map[string]int{"title": 5, "description": 1},
 		nil,
@@ -619,7 +620,7 @@ func TestCompactDeleted_SaveLoadAfterCompact(t *testing.T) {
 }
 
 func TestCompactDeleted_ConcurrentSearchDuringCompact(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"genre": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"genre": true}, 10)
 
 	// Index a batch of docs so compact has real work to do.
 	for i := 0; i < 200; i++ {
@@ -643,7 +644,7 @@ func TestCompactDeleted_ConcurrentSearchDuringCompact(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 50 {
-				res := se.Search("song", nil)
+				res, _ := se.Search(context.Background(), "song", nil)
 				_ = res
 			}
 		}()
@@ -664,14 +665,14 @@ func TestCompactDeleted_ConcurrentSearchDuringCompact(t *testing.T) {
 	}
 
 	// Post-compact sanity: surviving docs are searchable.
-	res := se.Search("song", nil)
+	res, _ := se.Search(context.Background(), "song", nil)
 	if res == nil {
 		t.Fatal("Search returned nil after concurrent compact")
 	}
 }
 
 func TestCompactDeleted_LargeBatch(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"year": true}, 20)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"year": true}, 20)
 
 	const total = 1000
 	for i := 0; i < total; i++ {
@@ -713,7 +714,7 @@ func TestCompactDeleted_LargeBatch(t *testing.T) {
 }
 
 func TestCompactDeleted_PrefixSearchWorksThroughSearchFunc(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, 10)
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
 
 	addDoc(t, se, map[string]interface{}{"id": "1", "title": "strawberry"})
 	addDoc(t, se, map[string]interface{}{"id": "2", "title": "strawman"})
@@ -723,7 +724,7 @@ func TestCompactDeleted_PrefixSearchWorksThroughSearchFunc(t *testing.T) {
 	se.CompactDeleted()
 
 	// Prefix "str" should expand to "strawberry" and "strawman" but not "stranger".
-	res := se.Search("str", nil)
+	res, _ := se.Search(context.Background(), "str", nil)
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -37,7 +38,7 @@ func assertEngineSearchIDs(t *testing.T, docs []engine.ReturnedDocument, exp ...
 
 func mustEngineSearch(t *testing.T, se *engine.SearchEngine, query string, filters map[string][]interface{}) []engine.ReturnedDocument {
 	t.Helper()
-	res := se.Search(query, filters)
+	res, _ := se.Search(context.Background(), query, filters)
 	if res == nil {
 		return nil
 	}
@@ -112,13 +113,13 @@ func TestCreateIndexHandler_FieldWeights(t *testing.T) {
 
 func TestListIndexesHandler(t *testing.T) {
 	h := NewHTTP()
-	h.engines["products"] = engine.NewSearchEngineWithFieldWeights(
+	h.engines["products"] = engine.NewSearchEngine(
 		[]string{"name", "tags"},
 		map[string]int{"name": 3, "tags": 1},
 		map[string]bool{"year": true, "category": true},
 		10,
 	)
-	h.engines["empty"] = engine.NewSearchEngine([]string{"title"}, nil, 5)
+	h.engines["empty"] = engine.NewSearchEngine([]string{"title"}, nil, nil, 5)
 
 	if err := h.engines["products"].AddOrUpdateDocument(map[string]interface{}{
 		"id": "1", "name": "Sunny Rio", "tags": "music", "year": "2020", "category": "album",
@@ -286,7 +287,7 @@ func TestSaveEngine_Success(t *testing.T) {
 	t.Setenv("SEARCH52_INDEX_DATA_DIR", tmp)
 	ht := NewHTTP()
 	idx := "idx"
-	ht.engines[idx] = engine.NewSearchEngine([]string{"name"}, nil, 1)
+	ht.engines[idx] = engine.NewSearchEngine([]string{"name"}, nil, nil, 1)
 	ht.engines[idx].Index([]map[string]interface{}{{"id": "1", "name": "val"}})
 
 	payload := fmt.Sprintf(`{"indexName":"%s"}`, idx)
@@ -348,7 +349,7 @@ func TestLoadEngine_Success(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("SEARCH52_INDEX_DATA_DIR", tmp)
 
-	se := engine.NewSearchEngineWithFieldWeights(
+	se := engine.NewSearchEngine(
 		[]string{"name", "tags"},
 		map[string]int{"name": 3, "tags": 1},
 		map[string]bool{"year": true},
@@ -401,7 +402,7 @@ func TestLoadEngine_CorruptPayloadKeepsExistingIndex(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("SEARCH52_INDEX_DATA_DIR", tmp)
 
-	existing := engine.NewSearchEngine([]string{"name"}, nil, 10)
+	existing := engine.NewSearchEngine([]string{"name"}, nil, nil, 10)
 	if err := existing.AddOrUpdateDocument(map[string]interface{}{
 		"id": "existing", "name": "kept alive",
 	}); err != nil {
@@ -446,7 +447,7 @@ func TestSearchHandler_Errors(t *testing.T) {
 		t.Errorf("GET /search missing index expected 400, got %d", rr.Code)
 	}
 
-	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, nil, map[string]bool{"year": true}, 10)
 	req = httptest.NewRequest(http.MethodGet, "/search?index=idx&q="+strings.Repeat("a", maxQueryLength+1), nil)
 	rr = httptest.NewRecorder()
 	h.Search(rr, req)
@@ -586,7 +587,7 @@ func TestAddToIndexHandler_Errors(t *testing.T) {
 	}
 
 	// Not multipart
-	h.engines["idx"] = engine.NewSearchEngine([]string{"f"}, nil, 1)
+	h.engines["idx"] = engine.NewSearchEngine([]string{"f"}, nil, nil, 1)
 	req = httptest.NewRequest(http.MethodPost, "/add-to-index?indexName=idx", strings.NewReader("not multipart"))
 	req.Header.Set("Content-Type", "text/plain")
 	rr = httptest.NewRecorder()
@@ -629,7 +630,7 @@ func TestAddToIndexHandler_Errors(t *testing.T) {
 
 func TestAddToIndexHandler_JSONSuccess(t *testing.T) {
 	h := NewHTTP()
-	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, nil, map[string]bool{"year": true}, 10)
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -666,7 +667,7 @@ func TestAddToIndexHandler_JSONSuccess(t *testing.T) {
 
 func TestAddToIndexHandler_CSVSuccess(t *testing.T) {
 	h := NewHTTP()
-	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, nil, map[string]bool{"year": true}, 10)
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -728,7 +729,7 @@ func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
 	}
 
 	// Invalid JSON
-	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+	h.engines["idx"] = engine.NewSearchEngine([]string{"name"}, nil, map[string]bool{"year": true}, 10)
 	req = httptest.NewRequest(http.MethodPost, "/document?indexName=idx", strings.NewReader("{bad json}"))
 	req.Header.Set("Content-Type", "application/json")
 	rr = httptest.NewRecorder()
@@ -794,7 +795,7 @@ func TestDeleteDocumentHandler_Errors(t *testing.T) {
 
 func TestCompactIndexHandler(t *testing.T) {
 	h := NewHTTP()
-	se := engine.NewSearchEngine([]string{"name"}, map[string]bool{"year": true}, 10)
+	se := engine.NewSearchEngine([]string{"name"}, nil, map[string]bool{"year": true}, 10)
 	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "name": "old title", "year": "2020"}); err != nil {
 		t.Fatalf("AddOrUpdateDocument old: %v", err)
 	}

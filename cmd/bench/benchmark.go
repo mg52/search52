@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -53,6 +54,7 @@ func runBenchmark(args []string) {
 	fmt.Printf("Building engine (fields: %s, filter: %s, result-size: %d)...\n", strings.Join(indexFields, "+"), *filterField, *resultSize)
 	se := engine.NewSearchEngine(
 		indexFields,
+		nil,
 		filters,
 		*resultSize,
 	)
@@ -106,7 +108,7 @@ func runBenchmark(args []string) {
 			if m.filter {
 				f = yearFs[w%queryPoolSize]
 			}
-			se.Search(q, f)
+			_, _ = se.Search(context.Background(), q, f)
 		}
 
 		runtime.GC()
@@ -124,7 +126,7 @@ func runBenchmark(args []string) {
 				f = yearFs[n%queryPoolSize]
 			}
 			t0 := time.Now()
-			se.Search(q, f)
+			_, _ = se.Search(context.Background(), q, f)
 			lats = append(lats, time.Since(t0).Nanoseconds())
 		}
 

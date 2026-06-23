@@ -5,6 +5,8 @@
 package engine
 
 import (
+	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/gob"
 	"errors"
@@ -56,16 +58,16 @@ type CompactStats struct {
 }
 
 // enginePayload is the gob-serializable snapshot of SearchEngine state.
+// Only active (non-tombstoned, current-version) documents are stored; deleted
+// docs are excluded at save time so the file stays small and LoadAll is fast.
+// ExternalToInternal, InternalToExternal, and NextInternalID are not saved —
+// they are fully derivable from the "id" field inside each document on load.
 type enginePayload struct {
-	Documents          map[uint32]map[string]interface{}
-	DocDeleted         map[uint32]bool
-	ExternalToInternal map[string]uint32
-	InternalToExternal map[uint32]string
-	NextInternalID     uint32
-	IndexFields        []string
-	FieldWeights       map[string]int
-	Filters            map[string]bool
-	ResultSize         int
+	Documents    map[uint32]map[string]interface{}
+	IndexFields  []string
+	FieldWeights map[string]int
+	Filters      map[string]bool
+	ResultSize   int
 }
 
 type termCandidate struct {
@@ -108,14 +110,10 @@ type SearchEngine struct {
 	mu sync.RWMutex
 }
 
-// NewSearchEngine constructs a new, empty engine ready to index documents.
-func NewSearchEngine(indexFields []string, filters map[string]bool, resultSize int) *SearchEngine {
-	return NewSearchEngineWithFieldWeights(indexFields, nil, filters, resultSize)
-}
-
-// NewSearchEngineWithFieldWeights constructs a new engine with per-index-field
-// scoring weights. Missing or non-positive weights default to 1.
-func NewSearchEngineWithFieldWeights(indexFields []string, fieldWeights map[string]int, filters map[string]bool, resultSize int) *SearchEngine {
+// NewSearchEngine constructs a new engine with per-index-field scoring weights.
+// Missing or non-positive weights default to 1. Pass nil for fieldWeights to
+// use uniform weights.
+func NewSearchEngine(indexFields []string, fieldWeights map[string]int, filters map[string]bool, resultSize int) *SearchEngine {
 	se := &SearchEngine{
 		DataMap:            make(map[string]map[uint32]int),
 		DocDeleted:         make(map[uint32]bool),
@@ -181,23 +179,41 @@ func init() {
 
 // -------------------- Persistence --------------------
 
-// SaveAll writes the engine snapshot to a single gob file at path + "/engine.gob".
+// SaveAll writes the engine snapshot to path + "/engine.gob" (gzip-compressed gob).
+//
+// Only active (non-deleted, current-version) documents are saved — tombstoned
+// internal IDs are excluded, so the file is smaller and LoadAll is faster.
+//
+// Locking: RLock is held only for the initial snapshot (RAM copies), not for
+// encoding or disk write, so writers block for milliseconds rather than the
+// full save duration.
 func (se *SearchEngine) SaveAll(path string) error {
+	// Step A: snapshot active state under a brief RLock.
+	// Iterate ExternalToInternal to visit only current versions; skip deleted.
+	// Shallow copy: inner document maps are immutable once written.
 	se.mu.RLock()
-	defer se.mu.RUnlock()
-
-	payload := enginePayload{
-		Documents:          se.Documents,
-		DocDeleted:         se.DocDeleted,
-		ExternalToInternal: se.ExternalToInternal,
-		InternalToExternal: se.InternalToExternal,
-		NextInternalID:     se.nextInternalID,
-		IndexFields:        se.IndexFields,
-		FieldWeights:       se.FieldWeights,
-		Filters:            se.Filters,
-		ResultSize:         se.ResultSize,
+	docs := make(map[uint32]map[string]interface{}, len(se.ExternalToInternal))
+	for _, internalID := range se.ExternalToInternal {
+		if se.DocDeleted[internalID] {
+			continue
+		}
+		doc := se.Documents[internalID]
+		if doc == nil {
+			continue
+		}
+		docs[internalID] = doc
 	}
+	payload := enginePayload{
+		Documents:    docs,
+		IndexFields:  append([]string(nil), se.IndexFields...),
+		FieldWeights: copyIntMap(se.FieldWeights),
+		Filters:      copyBoolMap(se.Filters),
+		ResultSize:   se.ResultSize,
+	}
+	se.mu.RUnlock()
 
+	// Step B: encode and write to disk with no lock held.
+	// Stack: file → bufio (4 MB) → gzip → gob encoder.
 	engineFile := path + "/engine.gob"
 	tmpFile := engineFile + ".tmp"
 
@@ -206,16 +222,27 @@ func (se *SearchEngine) SaveAll(path string) error {
 		return fmt.Errorf("create %s: %w", tmpFile, err)
 	}
 
-	enc := gob.NewEncoder(f)
-	if encErr := enc.Encode(payload); encErr != nil {
-		f.Close()
-		os.Remove(tmpFile)
-		return fmt.Errorf("encode engine payload: %w", encErr)
-	}
+	bw := bufio.NewWriterSize(f, 4<<20)
+	gz := gzip.NewWriter(bw)
 
-	if err := f.Close(); err != nil {
+	encErr := gob.NewEncoder(gz).Encode(payload)
+	gzErr := gz.Close()
+	flushErr := bw.Flush()
+	closeErr := f.Close()
+
+	if encErr != nil || gzErr != nil || flushErr != nil {
 		os.Remove(tmpFile)
-		return fmt.Errorf("close %s: %w", tmpFile, err)
+		if encErr != nil {
+			return fmt.Errorf("encode engine payload: %w", encErr)
+		}
+		if gzErr != nil {
+			return fmt.Errorf("close gzip writer: %w", gzErr)
+		}
+		return fmt.Errorf("flush %s: %w", tmpFile, flushErr)
+	}
+	if closeErr != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("close %s: %w", tmpFile, closeErr)
 	}
 
 	if err := os.Rename(tmpFile, engineFile); err != nil {
@@ -226,8 +253,10 @@ func (se *SearchEngine) SaveAll(path string) error {
 	return nil
 }
 
-// LoadAll restores documents + metadata, then rebuilds ALL derived structures
-// (DataMap, FilterDocs, Prefix, Symspell) from Documents.
+// LoadAll restores documents + metadata from path + "/engine.gob" (gzip-compressed),
+// then rebuilds all derived structures (DataMap, FilterBits, Prefix, Symspell) in
+// parallel. No lock is held during the rebuild — the engine is not yet visible to
+// callers, so all writes to local structures are unsynchronized.
 func LoadAll(path string) (*SearchEngine, error) {
 	engineFile := path + "/engine.gob"
 	f, err := os.Open(engineFile)
@@ -236,94 +265,150 @@ func LoadAll(path string) (*SearchEngine, error) {
 	}
 	defer f.Close()
 
+	gr, err := gzip.NewReader(bufio.NewReaderSize(f, 4<<20))
+	if err != nil {
+		return nil, fmt.Errorf("gzip reader %s: %w", engineFile, err)
+	}
+	defer gr.Close()
+
 	var payload enginePayload
-	dec := gob.NewDecoder(f)
-	if err := dec.Decode(&payload); err != nil {
+	if err := gob.NewDecoder(gr).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("decode engine payload: %w", err)
 	}
 	if err := validatePayload(payload); err != nil {
 		return nil, fmt.Errorf("invalid engine payload: %w", err)
 	}
 
-	// Base engine (derived fields empty; we will rebuild)
-	se := &SearchEngine{
-		DataMap:            make(map[string]map[uint32]int),
-		DocDeleted:         make(map[uint32]bool),
-		ExternalToInternal: make(map[string]uint32),
-		InternalToExternal: make(map[uint32]string),
-		nextInternalID:     1,
-		Documents:          make(map[uint32]map[string]interface{}),
-		FilterBits:         make(map[string][]uint64),
-		Prefix:             make(map[string][]string),
-		Symspell:           symspell.NewSymSpell(),
-		IndexFields:        nil,
-		FieldWeights:       make(map[string]int),
-		Filters:            make(map[string]bool),
-		ResultSize:         100,
-	}
-	se.termSet.Store(new(sync.Map))
-
-	// Restore docs + metadata
-	se.Documents = payload.Documents
-	se.DocDeleted = payload.DocDeleted
-	se.ExternalToInternal = payload.ExternalToInternal
-	se.InternalToExternal = payload.InternalToExternal
-	se.nextInternalID = payload.NextInternalID
-	se.IndexFields = payload.IndexFields
-	se.FieldWeights = normalizeFieldWeights(se.IndexFields, payload.FieldWeights)
-	se.Filters = payload.Filters
-	se.ResultSize = payload.ResultSize
-	if se.ResultSize <= 0 {
-		se.ResultSize = 100
+	fieldWeights := normalizeFieldWeights(payload.IndexFields, payload.FieldWeights)
+	resultSize := payload.ResultSize
+	if resultSize <= 0 {
+		resultSize = 100
 	}
 
-	// Safety: if NextInternalID missing/zero in older payloads
-	if se.nextInternalID == 0 {
-		var max uint32
-		for id := range se.InternalToExternal {
-			if id > max {
-				max = id
+	// Rebuild ExternalToInternal, InternalToExternal, and NextInternalID from
+	// the "id" field stored inside each document — no need to persist them.
+	extToInt := make(map[string]uint32, len(payload.Documents))
+	intToExt := make(map[uint32]string, len(payload.Documents))
+	var nextInternalID uint32 = 1
+	type activeDoc struct {
+		internalID uint32
+		doc        map[string]interface{}
+	}
+	active := make([]activeDoc, 0, len(payload.Documents))
+	for internalID, doc := range payload.Documents {
+		if doc == nil {
+			continue
+		}
+		rawID := doc["id"]
+		if rawID == nil {
+			continue
+		}
+		extID := fmt.Sprintf("%v", rawID)
+		if extID == "" || extID == "<nil>" {
+			continue
+		}
+		extToInt[extID] = internalID
+		intToExt[internalID] = extID
+		if internalID >= nextInternalID {
+			nextInternalID = internalID + 1
+		}
+		active = append(active, activeDoc{internalID: internalID, doc: doc})
+	}
+
+	// Parallel tokenization — weightedTokenScores is pure CPU, no shared state.
+	tokenResults := make([]map[string]int, len(active))
+	numWorkers := runtime.NumCPU()
+	workCh := make(chan int, numWorkers*4)
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range workCh {
+				tokenResults[i] = weightedTokenScores(active[i].doc, payload.IndexFields, fieldWeights)
+			}
+		}()
+	}
+	for i := range active {
+		workCh <- i
+	}
+	close(workCh)
+	wg.Wait()
+
+	// Build all derived structures locally — no lock needed; engine not yet visible.
+	newDataMap := make(map[string]map[uint32]int)
+	newFilterBits := make(map[string][]uint64)
+	newSymspell := symspell.NewSymSpell()
+	newTermSet := new(sync.Map)
+
+	for i, item := range active {
+		for token, score := range tokenResults[i] {
+			docMap, exists := newDataMap[token]
+			if !exists {
+				newTermSet.Store(token, struct{}{})
+				if utf8.RuneCountInString(token) >= 4 {
+					newSymspell.AddWord(token)
+				}
+				docMap = make(map[uint32]int)
+				newDataMap[token] = docMap
+			}
+			docMap[item.internalID] += score
+		}
+		for field := range payload.Filters {
+			value, exists := item.doc[field]
+			if !exists {
+				continue
+			}
+			for _, key := range filterKeys(field, value) {
+				newFilterBits[key] = filterBitSet(newFilterBits[key], item.internalID)
 			}
 		}
-		se.nextInternalID = max + 1
-		if se.nextInternalID == 0 {
-			se.nextInternalID = 1
+	}
+
+	// Build prefix map with terms sorted by document frequency (best prefix coverage).
+	type termFreq struct {
+		term string
+		freq int
+	}
+	tfs := make([]termFreq, 0, len(newDataMap))
+	for term, postings := range newDataMap {
+		tfs = append(tfs, termFreq{term, len(postings)})
+	}
+	sort.Slice(tfs, func(i, j int) bool {
+		if tfs[i].freq != tfs[j].freq {
+			return tfs[i].freq > tfs[j].freq
+		}
+		return tfs[i].term < tfs[j].term
+	})
+	newPrefix := make(map[string][]string)
+	for _, tf := range tfs {
+		for i := range tf.term {
+			if i == 0 {
+				continue
+			}
+			pfx := tf.term[:i]
+			if len(newPrefix[pfx]) < MaxPrefixTerms {
+				newPrefix[pfx] = append(newPrefix[pfx], tf.term)
+			}
 		}
 	}
 
-	// -------- Rebuild derived structures from Documents --------
-	//
-	// We rebuild ONLY current (non-deleted) versions:
-	// - If ExternalToInternal points to internalID X, and X is not deleted => index it.
-	// - Old internal IDs remain in Documents but are tombstoned => skipped.
-
-	// Helper to check if an internal docID is the current one for its externalID
-	isCurrent := func(internalID uint32) bool {
-		ext := se.InternalToExternal[internalID]
-		if ext == "" {
-			return false
-		}
-		cur, ok := se.ExternalToInternal[ext]
-		return ok && cur == internalID
+	se := &SearchEngine{
+		DataMap:            newDataMap,
+		DocDeleted:         make(map[uint32]bool),
+		ExternalToInternal: extToInt,
+		InternalToExternal: intToExt,
+		nextInternalID:     nextInternalID,
+		Documents:          payload.Documents,
+		FilterBits:         newFilterBits,
+		Prefix:             newPrefix,
+		Symspell:           newSymspell,
+		IndexFields:        payload.IndexFields,
+		FieldWeights:       fieldWeights,
+		Filters:            payload.Filters,
+		ResultSize:         resultSize,
 	}
-
-	se.mu.Lock()
-	for internalID, doc := range se.Documents {
-		if doc == nil || se.DocDeleted[internalID] || !isCurrent(internalID) {
-			continue
-		}
-
-		localScores := weightedTokenScores(doc, se.IndexFields, se.FieldWeights)
-		if len(localScores) == 0 {
-			continue
-		}
-
-		for token, score := range localScores {
-			se.indexTokenLocked(token, internalID, score)
-		}
-		se.setFilterBitsLocked(doc, internalID, se.Filters)
-	}
-	se.mu.Unlock()
+	se.termSet.Store(newTermSet)
 
 	return se, nil
 }
@@ -332,28 +417,11 @@ func validatePayload(payload enginePayload) error {
 	if payload.Documents == nil {
 		return errors.New("missing documents")
 	}
-	if payload.DocDeleted == nil {
-		return errors.New("missing deleted document map")
-	}
-	if payload.ExternalToInternal == nil {
-		return errors.New("missing external ID map")
-	}
-	if payload.InternalToExternal == nil {
-		return errors.New("missing internal ID map")
-	}
 	if len(payload.IndexFields) == 0 {
 		return errors.New("missing index fields")
 	}
 	if payload.ResultSize < 0 {
 		return errors.New("negative result size")
-	}
-	for ext, internal := range payload.ExternalToInternal {
-		if ext == "" || internal == 0 {
-			return fmt.Errorf("invalid external mapping %q -> %d", ext, internal)
-		}
-		if payload.InternalToExternal[internal] != ext {
-			return fmt.Errorf("inconsistent ID mapping for %q", ext)
-		}
 	}
 	return nil
 }
@@ -427,7 +495,6 @@ func (se *SearchEngine) indexTokenLocked(term string, id uint32, score int) {
 	docMap, termExists := se.DataMap[term]
 	if !termExists {
 		se.termSet.Load().Store(term, struct{}{})
-		// TODO: make it var in the engine definition
 		if utf8.RuneCountInString(term) >= 4 {
 			se.Symspell.AddWord(term)
 		}
@@ -782,7 +849,7 @@ func (se *SearchEngine) SingleTermSearchLoop(
 
 	var allowed []uint64
 	if len(filters) > 0 {
-		allowed = se.applyFilterLocked(filters)
+		allowed = se.ApplyFilterLocked(filters)
 		if allowed == nil {
 			return nil, nil
 		}
@@ -919,7 +986,7 @@ func (se *SearchEngine) MultiTermSearchLoop(
 
 	var allowed []uint64
 	if len(filters) > 0 {
-		allowed = se.applyFilterLocked(filters)
+		allowed = se.ApplyFilterLocked(filters)
 		if allowed == nil {
 			return nil, nil
 		}
@@ -1072,13 +1139,13 @@ BreakLoop:
 	return out, nil
 }
 
-// applyFilterLocked resolves filters to a bitset without acquiring any lock.
+// ApplyFilterLocked resolves filters to a bitset without acquiring any lock.
 // Caller must hold se.mu.RLock for the entire time the returned slice is used.
 //
 // Fast path (single field, single value): returns a direct reference into
 // se.FilterBits — zero allocation. Multi-value OR and multi-field AND still
 // allocate intermediate bitsets, but those cases are uncommon.
-func (se *SearchEngine) applyFilterLocked(filters map[string][]interface{}) []uint64 {
+func (se *SearchEngine) ApplyFilterLocked(filters map[string][]interface{}) []uint64 {
 	var result []uint64
 	first := true
 
@@ -1130,68 +1197,8 @@ func (se *SearchEngine) applyFilterLocked(filters map[string][]interface{}) []ui
 	return result
 }
 
-// ApplyFilter returns a bitset of internal docIDs that satisfy the given filters.
-// Semantics: OR within a field's values, AND across different fields.
-// Returns nil when filters produce no matches (or filters map is empty).
-// For internal search paths use applyFilterLocked to avoid the copy.
-func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) []uint64 {
-	if len(filters) == 0 {
-		return nil
-	}
-
-	se.mu.RLock()
-	defer se.mu.RUnlock()
-
-	var result []uint64
-	first := true
-
-	for field, values := range filters {
-		var fieldUnion []uint64
-		for _, v := range values {
-			key := fmt.Sprintf("%s:%v", field, v)
-			bits := se.FilterBits[key]
-			if len(bits) == 0 {
-				continue
-			}
-			if fieldUnion == nil {
-				fieldUnion = append([]uint64(nil), bits...)
-			} else {
-				fieldUnion = filterBitOr(fieldUnion, bits)
-			}
-		}
-
-		if fieldUnion == nil {
-			return nil
-		}
-
-		if first {
-			result = fieldUnion
-			first = false
-		} else {
-			result = filterBitAnd(result, fieldUnion)
-			hasAny := false
-			for _, w := range result {
-				if w != 0 {
-					hasAny = true
-					break
-				}
-			}
-			if !hasAny {
-				return nil
-			}
-		}
-	}
-
-	return result
-}
-
 // Search executes a query (single or multi-term), selecting between exact/prefix/fuzzy strategies.
-func (se *SearchEngine) Search(query string, filters map[string][]interface{}) *SearchResult {
-	res, _ := se.SearchContext(context.Background(), query, filters)
-	return res
-}
-
-func (se *SearchEngine) SearchContext(ctx context.Context, query string, filters map[string][]interface{}) (*SearchResult, error) {
+func (se *SearchEngine) Search(ctx context.Context, query string, filters map[string][]interface{}) (*SearchResult, error) {
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil, nil
@@ -1213,7 +1220,6 @@ func (se *SearchEngine) SingleTermSearch(
 
 	query := queryTokens[0]
 
-	// TODO: make these configurable in SearchEngine.
 	maxPrefixTokens := SingleTermMaxPrefixTokens
 	maxFuzzyTokens := SingleTermMaxFuzzyTokens
 

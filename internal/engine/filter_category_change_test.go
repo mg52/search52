@@ -1,13 +1,14 @@
 package engine
 
 import (
+	"context"
 	"testing"
 )
 
 // TestFilterCategoryChange_OldCategoryExcludesDoc verifies that after a document's
 // category changes, the old category no longer matches it in a filtered search.
 func TestFilterCategoryChange_OldCategoryExcludesDoc(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	if err := se.AddOrUpdateDocument(map[string]interface{}{
 		"id":       "1",
@@ -27,7 +28,7 @@ func TestFilterCategoryChange_OldCategoryExcludesDoc(t *testing.T) {
 	}
 
 	// Filtering by old category must not return the doc
-	res := se.Search("running", map[string][]interface{}{"category": {"sports"}})
+	res, _ := se.Search(context.Background(), "running", map[string][]interface{}{"category": {"sports"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -39,7 +40,7 @@ func TestFilterCategoryChange_OldCategoryExcludesDoc(t *testing.T) {
 // TestFilterCategoryChange_NewCategoryIncludesDoc verifies that after a document's
 // category changes, the new category correctly matches it in a filtered search.
 func TestFilterCategoryChange_NewCategoryIncludesDoc(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	if err := se.AddOrUpdateDocument(map[string]interface{}{
 		"id":       "1",
@@ -59,7 +60,7 @@ func TestFilterCategoryChange_NewCategoryIncludesDoc(t *testing.T) {
 	}
 
 	// Filtering by new category must return the doc
-	res := se.Search("running", map[string][]interface{}{"category": {"fashion"}})
+	res, _ := se.Search(context.Background(), "running", map[string][]interface{}{"category": {"fashion"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -69,7 +70,7 @@ func TestFilterCategoryChange_NewCategoryIncludesDoc(t *testing.T) {
 // TestFilterCategoryChange_NoFilterStillReturnsDoc verifies that an unfiltered
 // search still returns the doc after its category changes.
 func TestFilterCategoryChange_NoFilterStillReturnsDoc(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	if err := se.AddOrUpdateDocument(map[string]interface{}{
 		"id":       "1",
@@ -86,7 +87,7 @@ func TestFilterCategoryChange_NoFilterStillReturnsDoc(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument update: %v", err)
 	}
 
-	res := se.Search("hiking", nil)
+	res, _ := se.Search(context.Background(), "hiking", nil)
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -96,7 +97,7 @@ func TestFilterCategoryChange_NoFilterStillReturnsDoc(t *testing.T) {
 // TestFilterCategoryChange_DoesNotAffectSiblingDocs verifies that changing one
 // document's category does not affect the filter results of other documents.
 func TestFilterCategoryChange_DoesNotAffectSiblingDocs(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	docs := []map[string]interface{}{
 		{"id": "1", "title": "trail running", "category": "sports"},
@@ -128,7 +129,7 @@ func TestFilterCategoryChange_DoesNotAffectSiblingDocs(t *testing.T) {
 // TestFilterCategoryChange_MultiTerm verifies category-change filter correctness
 // on the multi-term search path.
 func TestFilterCategoryChange_MultiTerm(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	docs := []map[string]interface{}{
 		{"id": "1", "title": "apple phone", "category": "tech"},
@@ -149,7 +150,7 @@ func TestFilterCategoryChange_MultiTerm(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument update: %v", err)
 	}
 
-	res := se.Search("apple phone", map[string][]interface{}{"category": {"tech"}})
+	res, _ := se.Search(context.Background(), "apple phone", map[string][]interface{}{"category": {"tech"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -157,7 +158,7 @@ func TestFilterCategoryChange_MultiTerm(t *testing.T) {
 		t.Fatalf("expected no tech results after category change, got %+v", res.Docs)
 	}
 
-	res = se.Search("apple phone", map[string][]interface{}{"category": {"clearance"}})
+	res, _ = se.Search(context.Background(), "apple phone", map[string][]interface{}{"category": {"clearance"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -167,7 +168,7 @@ func TestFilterCategoryChange_MultiTerm(t *testing.T) {
 // TestFilterCategoryChange_WithCompact verifies that after CompactDeleted, the
 // old category's filter bits are fully pruned and the new category's bits survive.
 func TestFilterCategoryChange_WithCompact(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	if err := se.AddOrUpdateDocument(map[string]interface{}{
 		"id":       "1",
@@ -187,7 +188,7 @@ func TestFilterCategoryChange_WithCompact(t *testing.T) {
 	se.CompactDeleted()
 
 	// Old category must produce no results
-	res := se.Search("camping", map[string][]interface{}{"category": {"outdoors"}})
+	res, _ := se.Search(context.Background(), "camping", map[string][]interface{}{"category": {"outdoors"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -196,7 +197,7 @@ func TestFilterCategoryChange_WithCompact(t *testing.T) {
 	}
 
 	// New category must still return the doc
-	res = se.Search("camping", map[string][]interface{}{"category": {"sports"}})
+	res, _ = se.Search(context.Background(), "camping", map[string][]interface{}{"category": {"sports"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -216,7 +217,7 @@ func TestFilterCategoryChange_WithCompact(t *testing.T) {
 // TestFilterCategoryChange_ArrayCategory verifies that array-valued filter fields
 // are correctly updated when a document is re-indexed with a different set.
 func TestFilterCategoryChange_ArrayCategory(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	// doc1 belongs to music and party
 	if err := se.AddOrUpdateDocument(map[string]interface{}{
@@ -237,7 +238,7 @@ func TestFilterCategoryChange_ArrayCategory(t *testing.T) {
 	}
 
 	// music category must now return nothing for doc1
-	res := se.Search("summer", map[string][]interface{}{"category": {"music"}})
+	res, _ := se.Search(context.Background(), "summer", map[string][]interface{}{"category": {"music"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -246,14 +247,14 @@ func TestFilterCategoryChange_ArrayCategory(t *testing.T) {
 	}
 
 	// party category must still return doc1
-	res = se.Search("summer", map[string][]interface{}{"category": {"party"}})
+	res, _ = se.Search(context.Background(), "summer", map[string][]interface{}{"category": {"party"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
 	assertIDs(t, res.Docs, "1")
 
 	// outdoor category must return doc1 (newly added)
-	res = se.Search("summer", map[string][]interface{}{"category": {"outdoor"}})
+	res, _ = se.Search(context.Background(), "summer", map[string][]interface{}{"category": {"outdoor"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -265,6 +266,7 @@ func TestFilterCategoryChange_ArrayCategory(t *testing.T) {
 func TestFilterCategoryChange_MultipleFilterFields(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title"},
+		nil,
 		map[string]bool{"category": true, "year": true},
 		10,
 	)
@@ -312,7 +314,7 @@ func TestFilterCategoryChange_MultipleFilterFields(t *testing.T) {
 // TestFilterCategoryChange_SaveLoad verifies that a category-changed document is
 // correctly re-indexed after a save/load cycle.
 func TestFilterCategoryChange_SaveLoad(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	if err := se.AddOrUpdateDocument(map[string]interface{}{
 		"id":       "1",
@@ -339,7 +341,7 @@ func TestFilterCategoryChange_SaveLoad(t *testing.T) {
 	}
 
 	// Old category must not match after load
-	res := loaded.Search("electric", map[string][]interface{}{"category": {"music"}})
+	res, _ := loaded.Search(context.Background(), "electric", map[string][]interface{}{"category": {"music"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -348,7 +350,7 @@ func TestFilterCategoryChange_SaveLoad(t *testing.T) {
 	}
 
 	// New category must match after load
-	res = loaded.Search("electric", map[string][]interface{}{"category": {"equipment"}})
+	res, _ = loaded.Search(context.Background(), "electric", map[string][]interface{}{"category": {"equipment"}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -358,7 +360,7 @@ func TestFilterCategoryChange_SaveLoad(t *testing.T) {
 // TestFilterCategoryChange_Sequential verifies that multiple sequential category
 // changes all resolve correctly to the latest value.
 func TestFilterCategoryChange_Sequential(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	categories := []string{"alpha", "beta", "gamma", "delta"}
 	for _, cat := range categories {
@@ -373,7 +375,7 @@ func TestFilterCategoryChange_Sequential(t *testing.T) {
 
 	// Only the final category should match
 	final := categories[len(categories)-1]
-	res := se.Search("shape", map[string][]interface{}{"category": {final}})
+	res, _ := se.Search(context.Background(), "shape", map[string][]interface{}{"category": {final}})
 	if res == nil {
 		t.Fatal("Search returned nil")
 	}
@@ -381,7 +383,7 @@ func TestFilterCategoryChange_Sequential(t *testing.T) {
 
 	// All previous categories must not match
 	for _, old := range categories[:len(categories)-1] {
-		res = se.Search("shape", map[string][]interface{}{"category": {old}})
+		res, _ = se.Search(context.Background(), "shape", map[string][]interface{}{"category": {old}})
 		if res == nil {
 			t.Fatal("Search returned nil")
 		}
@@ -394,7 +396,7 @@ func TestFilterCategoryChange_Sequential(t *testing.T) {
 // TestFilterCategoryChange_BulkIndexPath verifies category-change filter
 // correctness when documents are re-indexed via the bulk Index() path.
 func TestFilterCategoryChange_BulkIndexPath(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, map[string]bool{"category": true}, 10)
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
 
 	batch1 := []map[string]interface{}{
 		{"id": "1", "title": "acoustic guitar", "category": "music"},

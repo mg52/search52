@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"runtime"
@@ -161,6 +162,7 @@ func buildRealisticCorpus(n int) benchCorpus {
 
 	se := NewSearchEngine(
 		[]string{"title", "tags"},
+		nil,
 		map[string]bool{"year": true},
 		100,
 	)
@@ -250,7 +252,7 @@ func runSearchBench(b *testing.B, n int) {
 		b.ReportMetric(c.heapMB, "heap_MB")
 		idx := 0
 		runAndMeasure(b, func() {
-			_ = c.engine.Search(c.singleExact[idx%queryPoolSize], nil)
+			_, _ = c.engine.Search(context.Background(), c.singleExact[idx%queryPoolSize], nil)
 			idx++
 		})
 	})
@@ -260,7 +262,7 @@ func runSearchBench(b *testing.B, n int) {
 		b.ReportMetric(c.heapMB, "heap_MB")
 		idx := 0
 		runAndMeasure(b, func() {
-			_ = c.engine.Search(c.singleExact[idx%queryPoolSize], c.yearFilters[idx%queryPoolSize])
+			_, _ = c.engine.Search(context.Background(), c.singleExact[idx%queryPoolSize], c.yearFilters[idx%queryPoolSize])
 			idx++
 		})
 	})
@@ -270,7 +272,7 @@ func runSearchBench(b *testing.B, n int) {
 		b.ReportMetric(c.heapMB, "heap_MB")
 		idx := 0
 		runAndMeasure(b, func() {
-			_ = c.engine.Search(c.multiExact[idx%queryPoolSize], nil)
+			_, _ = c.engine.Search(context.Background(), c.multiExact[idx%queryPoolSize], nil)
 			idx++
 		})
 	})
@@ -280,7 +282,7 @@ func runSearchBench(b *testing.B, n int) {
 		b.ReportMetric(c.heapMB, "heap_MB")
 		idx := 0
 		runAndMeasure(b, func() {
-			_ = c.engine.Search(c.multiExact[idx%queryPoolSize], c.yearFilters[idx%queryPoolSize])
+			_, _ = c.engine.Search(context.Background(), c.multiExact[idx%queryPoolSize], c.yearFilters[idx%queryPoolSize])
 			idx++
 		})
 	})

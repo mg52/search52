@@ -417,7 +417,7 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), searchTimeout)
 	defer cancel()
-	result, err := sec.SearchContext(ctx, query, filters)
+	result, err := sec.Search(ctx, query, filters)
 	if err != nil {
 		if errors.Is(err, engine.ErrSearchCanceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			errJSON(w, http.StatusGatewayTimeout, fmt.Errorf("search canceled after %s", searchTimeout))
@@ -470,7 +470,7 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	sec := engine.NewSearchEngineWithFieldWeights(
+	sec := engine.NewSearchEngine(
 		req.IndexFields,
 		req.FieldWeights,
 		filterMap,

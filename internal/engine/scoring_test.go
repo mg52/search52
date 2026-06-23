@@ -6,7 +6,7 @@ import (
 )
 
 func TestWeightedFieldsAffectRanking(t *testing.T) {
-	se := NewSearchEngineWithFieldWeights(
+	se := NewSearchEngine(
 		[]string{"title", "description"},
 		map[string]int{"title": 5, "description": 1},
 		nil,
@@ -99,7 +99,7 @@ func TestWeightedFieldsDefaultMatchesUnweightedScoring(t *testing.T) {
 }
 
 func TestAddOrUpdateDocumentUsesFieldWeights(t *testing.T) {
-	se := NewSearchEngineWithFieldWeights(
+	se := NewSearchEngine(
 		[]string{"title", "description"},
 		map[string]int{"title": 4, "description": 1},
 		nil,
@@ -131,7 +131,7 @@ func TestAddOrUpdateDocumentUsesFieldWeights(t *testing.T) {
 }
 
 func TestAddOrUpdateDocumentReindexesWeightedScores(t *testing.T) {
-	se := NewSearchEngineWithFieldWeights(
+	se := NewSearchEngine(
 		[]string{"title", "description"},
 		map[string]int{"title": 5, "description": 1},
 		nil,
