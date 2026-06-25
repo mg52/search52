@@ -11,7 +11,7 @@ var (
 	ExactMatchBoost           = 10
 	SingleTermMaxPrefixTokens = 3
 	SingleTermMaxFuzzyTokens  = 2
-	SingleTermSkipWholeScan   = true
+	SingleTermSkipWholeScan   = false
 	MultiTermSkipWholeScan    = false
 )
 
@@ -47,29 +47,24 @@ func init() {
 	}
 }
 
-// multiTermPrefixLimit caps prefix expansion for the last token of a multi-term
-// query. Lower than prefixLimitForQuery because each extra candidate multiplies
-// the inner-loop cost by the size of every other group's anchor posting list.
-// The prefix map is sorted by term frequency so top-N still covers the most
-// relevant completions.
 func multiTermPrefixLimit(prefix string) int {
 	switch {
 	case len(prefix) <= 2:
-		return 30
+		return 50
 	case len(prefix) <= 5:
-		return 80
+		return 40
 	default:
-		return 100
+		return 30
 	}
 }
 
 func fuzzyLimitForQuery(fuzzy string) int {
 	switch {
 	case len(fuzzy) <= 4:
-		return 80
-	case len(fuzzy) <= 6:
-		return 50
-	default:
 		return 30
+	case len(fuzzy) <= 6:
+		return 20
+	default:
+		return 10
 	}
 }

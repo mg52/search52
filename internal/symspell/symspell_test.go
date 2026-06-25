@@ -570,3 +570,76 @@ func TestDeleteWord_ThenReAdd(t *testing.T) {
 		t.Errorf("expected 'rocket' after re-adding, got %v", got)
 	}
 }
+
+// TestSortByFrequency_OrdersBucketByFreqDesc verifies that a shared delete
+// bucket is reordered by descending frequency, with alphabetical tie-breaking,
+// regardless of the order in which the words were added.
+func TestSortByFrequency_OrdersBucketByFreqDesc(t *testing.T) {
+	ss := NewSymSpell()
+	// Added rare-first so insertion order does NOT match frequency.
+	for _, w := range []string{"irok", "irop", "iron"} {
+		ss.AddWord(w)
+	}
+	freq := map[string]int{"iron": 100, "irok": 1, "irop": 1}
+
+	ss.SortByFrequency(func(w string) int { return freq[w] })
+
+	// All three delete (last rune) to "iro".
+	got := ss.DeleteMap["iro"]
+	want := []string{"iron", "irok", "irop"} // freq desc, then alpha for the ties
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DeleteMap[\"iro\"] = %v; want %v", got, want)
+	}
+}
+
+// TestSortByFrequency_FuzzySearchReturnsHighFreqFirst verifies that after
+// sorting, FuzzySearch surfaces the highest-frequency correction first even
+// under a cap smaller than the number of candidates.
+func TestSortByFrequency_FuzzySearchReturnsHighFreqFirst(t *testing.T) {
+	ss := NewSymSpell()
+	for _, w := range []string{"irok", "irop", "iroq", "iros", "iron"} {
+		ss.AddWord(w)
+	}
+	freq := map[string]int{"iron": 100, "irok": 1, "irop": 1, "iroq": 1, "iros": 1}
+
+	ss.SortByFrequency(func(w string) int { return freq[w] })
+
+	got := ss.FuzzySearch("irom", 1) // cap of 1 keeps only the best correction
+	if len(got) != 1 || got[0] != "iron" {
+		t.Fatalf("FuzzySearch(\"irom\", 1) = %v; want [iron]", got)
+	}
+}
+
+// TestSortByFrequency_TieBreakAlphabetical verifies deterministic alphabetical
+// ordering when frequencies are equal.
+func TestSortByFrequency_TieBreakAlphabetical(t *testing.T) {
+	ss := NewSymSpell()
+	for _, w := range []string{"irob", "iroa", "iroc"} {
+		ss.AddWord(w)
+	}
+	ss.SortByFrequency(func(string) int { return 5 }) // all equal frequency
+
+	got := ss.DeleteMap["iro"]
+	want := []string{"iroa", "irob", "iroc"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DeleteMap[\"iro\"] = %v; want %v", got, want)
+	}
+}
+
+// TestSortByFrequency_SingletonBucketNoPanic verifies that buckets with fewer
+// than two entries are left untouched and do not invoke freqOf.
+func TestSortByFrequency_SingletonBucketNoPanic(t *testing.T) {
+	ss := NewSymSpell()
+	ss.AddWord("hello")
+
+	called := false
+	ss.SortByFrequency(func(string) int { called = true; return 0 })
+
+	if called {
+		t.Fatalf("freqOf should not be called for singleton buckets")
+	}
+	got := ss.FuzzySearch("hallo", 5)
+	if len(got) != 1 || got[0] != "hello" {
+		t.Fatalf("FuzzySearch(\"hallo\") = %v; want [hello]", got)
+	}
+}

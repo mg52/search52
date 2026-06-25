@@ -676,6 +676,7 @@ func loadDocTokenPools(path string, fields []string) ([][]string, error) {
 // index. Misspell (10%) and last-token prefix-truncation (25%) are applied
 // with the same probabilities as the vocab-based builder.
 func buildLoadtestMultiQueriesFromDocs(r *rand.Rand, pools [][]string, count, prefixMinLen, prefixMaxLen int) []loadTestQuery {
+	// rand.Seed(time.Now().UnixNano())
 	qs := make([]loadTestQuery, count)
 	for i := range qs {
 		pool := pools[r.Intn(len(pools))]
@@ -708,8 +709,12 @@ func buildLoadtestMultiQueriesFromDocs(r *rand.Rand, pools [][]string, count, pr
 				}
 			}
 		}
+		joinedTerms := joinTerms(terms)
+		// if rand.Intn(10) == 0 {
+		// fmt.Println("multi term query:", joinedTerms)
+		// }
 		qs[i] = loadTestQuery{
-			query:      joinTerms(terms),
+			query:      joinedTerms,
 			misspelled: misspelled,
 			prefix:     prefix,
 			prefixLen:  prefixLen,

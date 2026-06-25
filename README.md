@@ -9,8 +9,9 @@ A lightweight, fast, in-memory inverted-index search engine with HTTP handlers a
 - **Full-text indexing** on arbitrary JSON documents  
 - **Prefix & fuzzy matching** — prefix map for instant completions + SymSpell for Levenshtein fuzzy suggestions  
 - **Filters** on arbitrary document fields (OR within a field, AND across fields)  
+- **Popularity ranking** — a static `popularity` field boosts search scores  
 - **HTTP API** for index creation, search, single-doc upsert/delete, bulk add  
-- **Persistence** — saves documents + metadata and rebuilds all derived indexes on load  
+- **Persistence** — saves documents + metadata + popularity and rebuilds all derived indexes on load  
 - **Docker-ready** — runs as an unprivileged user, persists under a mounted volume  
 
 ---
@@ -128,12 +129,14 @@ Documents are identified internally by a monotonically increasing `uint32`:
 
 | Map | Purpose |
 |---|---|
-| `ExternalToInternal` | caller's string ID → current internal ID |
-| `InternalToExternal` | internal ID → caller's string ID |
-| `Documents` | internal ID → raw field map |
-| `DocDeleted` | internal ID → tombstoned? |
+| `ExternalToInternal` | caller's string ID → current internal ID (active docs only) |
+| `InternalToExternal` | internal ID → caller's string ID (active docs only) |
+| `Documents` | internal ID → raw field map (active docs only) |
+| `DocDeleted` | tombstoned internal ID → true |
 
-**Update semantics**: updating a document assigns a new internal ID and sets `DocDeleted[oldID] = true`. Searches skip tombstoned IDs at scan time, while the new version is tokenized and indexed normally. To reclaim old posting-list entries, call the compact endpoint; it rebuilds the inverted index, filter bitsets, prefix map, and fuzzy dictionary from active documents only.
+**Update / delete semantics**: updating a document assigns a new internal ID for the new version; deleting removes it outright. In both cases the old internal ID is **eagerly removed** from `Documents`, `ExternalToInternal`, `InternalToExternal`, and the popularity maps, and is recorded in `DocDeleted`. The doc-level maps therefore only ever hold live records — `storedDocs` always equals `activeDocs`.
+
+What is *not* cleaned up eagerly are the old version's entries in the inverted index (`DataMap`) and filter bitsets (`FilterBits`); removing a single ID from every posting list is too expensive, so those stale entries linger and are skipped at scan time via the `DocDeleted` tombstone. `len(DocDeleted)` is the count of versions awaiting reclaim and is surfaced as `deletedVersions` in the list-indexes response — a good signal for when to compact. The compact endpoint rebuilds the inverted index, filter bitsets, prefix map, and fuzzy dictionary from active documents only, then clears all tombstones. Compaction reassigns internal IDs densely from 1, and rebuilds in parallel (workers tokenize while a single consumer writes, so peak memory stays bounded). Popularity scores are keyed by external ID and survive compaction untouched.
 
 ### 3. Prefix and Fuzzy Matching
 
@@ -205,9 +208,21 @@ Rather than intersecting all groups eagerly, the engine picks the **smallest gro
 
 Score for a matching document is the sum of its scores across all matched groups.
 
-### 8. Persistence
+### 8. Popularity Ranking
 
-`SaveAll` serialises only the raw document store and metadata (IDs, field config) to a single gob file. `LoadAll` restores the documents and then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `SymSpell` — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change. If `engine.gob` is corrupt or fails validation during the HTTP load endpoint, the existing in-memory index is left unchanged and the endpoint returns a clear error.
+A static signal adds a flat boost to a document's match score, keyed by external ID:
+
+```go
+StaticPopularity map[string]int // from the doc's "popularity" field at index time
+```
+
+- **Static popularity** is read from each document's `popularity` field (int or numeric) when it is indexed or updated. Writing a document with no/zero `popularity` clears any previous value. Deleting a document clears its popularity entry.
+
+During search, `staticPop[extID]` is added to the boosted term score before the candidate enters the top-k heap, in both single- and multi-term paths. The lookup is guarded by a `hasPopularity` flag so indexes that use no popularity pay zero overhead. Because the map is keyed by external ID and maintained in sync with the active set, it needs no special handling in compaction.
+
+### 9. Persistence
+
+`SaveAll` serialises only the active document store, metadata (field config), and the popularity map to a single gob file — tombstoned versions are never written. `LoadAll` restores the documents and popularity, then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `SymSpell`, and the ID maps — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change. If `engine.gob` is corrupt or fails validation during the HTTP load endpoint, the existing in-memory index is left unchanged and the endpoint returns a clear error.
 
 ---
 
@@ -262,7 +277,7 @@ curl -X POST http://localhost:8080/create-index \
 curl http://localhost:8080/list-indexes
 ```
 
-The response includes every in-memory index and its current active document count. `storedDocs` includes old tombstoned document versions retained for update/delete performance, while `activeDocs` is the current live record count.
+The response includes every in-memory index and its document counts. `activeDocs` is the current live record count; `storedDocs` is the number of documents materialised in memory (always equal to `activeDocs`, since tombstoned versions are removed eagerly); `deletedVersions` is the number of stale posting/bitset versions awaiting reclaim by compaction (`len(DocDeleted)`) — when this grows large, run compact.
 
 ```json
 {
@@ -273,7 +288,7 @@ The response includes every in-memory index and its current active document coun
     {
       "name": "products",
       "activeDocs": 2,
-      "storedDocs": 3,
+      "storedDocs": 2,
       "deletedVersions": 1,
       "indexFields": ["name", "tags"],
       "filters": ["year"],
@@ -291,7 +306,7 @@ curl -X POST 'http://localhost:8080/add-to-index?indexName=products' \
   -F 'file=@docs.json'
 ```
 
-The uploaded file can be either a JSON array of objects or a CSV file with a header row. Every document should include an `id` field; documents without a usable `id` are skipped by the indexer.
+The uploaded file can be either a JSON array of objects or a CSV file with a header row. Every document should include an `id` field; documents without a usable `id` are skipped by the indexer. An optional numeric `popularity` field is read as a static ranking boost.
 
 JSON example:
 
@@ -382,7 +397,7 @@ curl -X POST http://localhost:8080/compact-index \
   -d '{ "indexName": "products" }'
 ```
 
-Compaction removes tombstoned old document versions from all postings, filters, prefix arrays, fuzzy data, and document maps. The response includes before/after active and stored document counts.
+Compaction removes tombstoned old document versions from all postings, filters, prefix arrays, and fuzzy data, and reassigns internal IDs densely from 1. Popularity scores are preserved. The response includes before/after active and stored document counts plus the number of removed versions.
 
 ### 10. Health Check
 

@@ -111,11 +111,11 @@ func TestCompactDeleted_Stats(t *testing.T) {
 	addDoc(t, se, map[string]interface{}{"id": "1", "title": "iron maiden updated", "genre": "metal", "year": "1981"})
 	delDoc(t, se, "2")
 
-	// 3 stored (original 1, updated 1, original 2), 1 active (doc1 latest version).
+	// 1 stored (only current version of doc1 — old version removed by AddOrUpdate, doc2 removed by DeleteDocument).
 	stats := se.CompactDeleted()
 
-	if stats.BeforeStored != 3 {
-		t.Errorf("BeforeStored: got %d want 3", stats.BeforeStored)
+	if stats.BeforeStored != 1 {
+		t.Errorf("BeforeStored: got %d want 1", stats.BeforeStored)
 	}
 	if stats.BeforeActive != 1 {
 		t.Errorf("BeforeActive: got %d want 1", stats.BeforeActive)
@@ -126,8 +126,8 @@ func TestCompactDeleted_Stats(t *testing.T) {
 	if stats.AfterActive != 1 {
 		t.Errorf("AfterActive: got %d want 1", stats.AfterActive)
 	}
-	if stats.RemovedVersions != 2 {
-		t.Errorf("RemovedVersions: got %d want 2", stats.RemovedVersions)
+	if stats.RemovedVersions != 0 {
+		t.Errorf("RemovedVersions: got %d want 0", stats.RemovedVersions)
 	}
 }
 
@@ -529,8 +529,8 @@ func TestCompactDeleted_MultipleVersionsOnlyLatestSurvives(t *testing.T) {
 
 	stats := se.CompactDeleted()
 
-	if stats.BeforeStored != 3 || stats.AfterStored != 1 {
-		t.Errorf("expected 3→1 after compact, got %+v", stats)
+	if stats.BeforeStored != 1 || stats.AfterStored != 1 {
+		t.Errorf("expected 1→1 after compact, got %+v", stats)
 	}
 
 	// Only "three" terms remain; "one" and "two" are gone.
@@ -704,10 +704,7 @@ func TestCompactDeleted_LargeBatch(t *testing.T) {
 	if docDeletedLen(se) != 0 {
 		t.Errorf("DocDeleted should be empty after large compact, got %d", docDeletedLen(se))
 	}
-	if stats.AfterStored >= stats.BeforeStored {
-		t.Errorf("compact should reduce stored count: before=%d after=%d",
-			stats.BeforeStored, stats.AfterStored)
-	}
+
 
 	idMapsConsistent(t, se)
 	allInternalIDsInDocuments(t, se)

@@ -1,5 +1,7 @@
 package symspell
 
+import "sort"
+
 // SymSpell implements the Symmetric-Delete spelling correction algorithm
 // for edit-distance-1 fuzzy search. It precomputes all single-character
 // deletions of each dictionary word and stores them in a map for O(m) lookup.
@@ -43,6 +45,30 @@ func (s *SymSpell) appendUnique(key, word string) {
 	s.DeleteMap[key] = append(s.DeleteMap[key], word)
 }
 
+// SortByFrequency orders every delete bucket by descending word frequency (as
+// reported by freqOf), with alphabetical tie-breaking for determinism. Because
+// FuzzySearch walks each bucket front-to-back, keeping the buckets frequency-
+// sorted lets the most common corrections surface first with zero per-query
+// sorting. Callers invoke this once at an index finalize point (Index,
+// CompactDeleted, LoadAll) after all words are present, so FuzzySearch stays
+// allocation- and sort-free on the hot path.
+func (s *SymSpell) SortByFrequency(freqOf func(word string) int) {
+	for _, words := range s.DeleteMap {
+		if len(words) < 2 {
+			continue
+		}
+		// In-place sort mutates the slice's backing array, which the map entry
+		// already references — no reassignment needed.
+		sort.Slice(words, func(i, j int) bool {
+			fi, fj := freqOf(words[i]), freqOf(words[j])
+			if fi != fj {
+				return fi > fj
+			}
+			return words[i] < words[j]
+		})
+	}
+}
+
 // LoadDictionary adds all words in the slice to the SymSpell index.
 func (s *SymSpell) LoadDictionary(words []string) {
 	for _, w := range words {
@@ -81,28 +107,27 @@ func (s *SymSpell) removeFrom(key, word string) {
 	}
 }
 
-// FuzzySearch returns up to maxReturnCount dictionary words within
-// Levenshtein distance ≤ 1 of query. Caller must hold se.mu.RLock().
+// FuzzySearch returns dictionary words within Levenshtein distance ≤ 1 of query,
+// in insertion order. If maxReturnCount > 0 the result is capped at that many
+// words; if maxReturnCount <= 0 the full ED1 candidate set is returned so the
+// caller can rank it (e.g. by corpus frequency) before truncating. Caller must
+// hold se.mu.RLock().
 func (s *SymSpell) FuzzySearch(query string, maxReturnCount int) []string {
-	results := make([]string, 0, maxReturnCount)
+	results := []string{}
+	seen := make(map[string]struct{})
 
 	add := func(key string) bool {
 		for _, w := range s.DeleteMap[key] {
 			if w == query {
 				continue
 			}
-			dup := false
-			for _, r := range results {
-				if r == w {
-					dup = true
-					break
-				}
+			if _, dup := seen[w]; dup {
+				continue
 			}
-			if !dup {
-				results = append(results, w)
-				if len(results) >= maxReturnCount {
-					return true
-				}
+			seen[w] = struct{}{}
+			results = append(results, w)
+			if maxReturnCount > 0 && len(results) >= maxReturnCount {
+				return true
 			}
 		}
 		return false

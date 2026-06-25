@@ -165,6 +165,30 @@ type CompactIndexResponse struct {
 	DurationMs int64               `json:"durationMs"`
 }
 
+type UpdatePrefixRequest struct {
+	IndexName string `json:"indexName"`
+}
+
+type UpdatePrefixResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
+	IndexName  string `json:"indexName"`
+	Duration   string `json:"duration"`
+	DurationMs int64  `json:"durationMs"`
+}
+
+type UpdatePrefixAndFuzzyRequest struct {
+	IndexName string `json:"indexName"`
+}
+
+type UpdatePrefixAndFuzzyResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
+	IndexName  string `json:"indexName"`
+	Duration   string `json:"duration"`
+	DurationMs int64  `json:"durationMs"`
+}
+
 type HealthResponse struct {
 	Status     string `json:"status"`
 	StatusCode int    `json:"statusCode"`
@@ -367,7 +391,7 @@ func (ht *HTTP) ListIndexes(w http.ResponseWriter, r *http.Request) {
 			FieldWeights:    stats.FieldWeights,
 			Filters:         filters,
 			ResultCount:     stats.ResultSize,
-			DeletedVersions: stats.StoredDocuments - stats.ActiveDocuments,
+			DeletedVersions: stats.TombstonedVersions,
 		})
 	}
 
@@ -845,6 +869,90 @@ func (ht *HTTP) CompactIndex(w http.ResponseWriter, r *http.Request) {
 		StatusCode: http.StatusOK,
 		IndexName:  req.IndexName,
 		Stats:      stats,
+		Duration:   duration.String(),
+		DurationMs: duration.Milliseconds(),
+	})
+}
+
+// UpdatePrefix rebuilds the prefix lookup table for the named index from its
+// current active postings.
+func (ht *HTTP) UpdatePrefix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+
+	var req UpdatePrefixRequest
+	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+
+	ht.mu.RLock()
+	sec, ok := ht.engines[req.IndexName]
+	ht.mu.RUnlock()
+	if !ok {
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
+		return
+	}
+
+	start := time.Now()
+	sec.UpdatePrefix()
+	duration := time.Since(start)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(UpdatePrefixResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
+		IndexName:  req.IndexName,
+		Duration:   duration.String(),
+		DurationMs: duration.Milliseconds(),
+	})
+}
+
+// UpdatePrefixAndFuzzy rebuilds the prefix lookup table and re-establishes the
+// frequency ordering of the fuzzy buckets for the named index.
+func (ht *HTTP) UpdatePrefixAndFuzzy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+
+	var req UpdatePrefixAndFuzzyRequest
+	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+
+	ht.mu.RLock()
+	sec, ok := ht.engines[req.IndexName]
+	ht.mu.RUnlock()
+	if !ok {
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
+		return
+	}
+
+	start := time.Now()
+	sec.UpdatePrefixAndFuzzy()
+	duration := time.Since(start)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(UpdatePrefixAndFuzzyResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
+		IndexName:  req.IndexName,
 		Duration:   duration.String(),
 		DurationMs: duration.Milliseconds(),
 	})

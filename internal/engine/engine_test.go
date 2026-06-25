@@ -41,7 +41,8 @@ func newTestEngine() *SearchEngine {
 			2: "doc2",
 			3: "doc3",
 		},
-		ResultSize: 100,
+		nextInternalID: 4,
+		ResultSize:     100,
 	}
 	return se
 }
@@ -94,7 +95,8 @@ func newTestEngineForMultiTerm() *SearchEngine {
 			12: "doc12",
 			70: "doc70",
 		},
-		ResultSize: 2,
+		nextInternalID: 71,
+		ResultSize:     2,
 	}
 	return se
 }
@@ -147,6 +149,154 @@ func TestSingleTermSearchBoostsExactMatchOverPrefixCandidate(t *testing.T) {
 	}
 	if res.Docs[1].ID != "prefix" || res.Docs[1].Score != 100000 {
 		t.Fatalf("expected unboosted prefix candidate second, got %+v", res.Docs[1])
+	}
+}
+
+// TestFuzzyRanksByFrequency verifies that a misspelled query resolves to the
+// highest-frequency edit-distance-1 correction even when rarer neighbours were
+// indexed first. The fuzzy cap (SingleTermMaxFuzzyTokens) is smaller than the
+// number of rare neighbours, so under the old insertion-order truncation the cap
+// would be consumed by the rare neighbours and the common correction ("iron")
+// would never reach the search. Build-time frequency sorting of the SymSpell
+// buckets floats it to the front, so it survives the cap.
+func TestFuzzyRanksByFrequency(t *testing.T) {
+	se := NewSearchEngine([]string{"title"}, nil, nil, 100)
+
+	docs := []map[string]interface{}{
+		// Rare ED1 neighbours of "irom", indexed first so they head the
+		// SymSpell insertion order.
+		{"id": "r1", "title": "irok"},
+		{"id": "r2", "title": "irop"},
+		{"id": "r3", "title": "iroq"},
+		{"id": "r4", "title": "iros"},
+	}
+	// "iron" appears in many documents -> highest corpus frequency, but indexed last.
+	for i := 0; i < 5; i++ {
+		docs = append(docs, map[string]interface{}{"id": fmt.Sprintf("n%d", i), "title": "iron"})
+	}
+	se.Index(docs)
+
+	res, err := se.Search(context.Background(), "irom", nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if res == nil || len(res.Docs) == 0 {
+		t.Fatalf("expected fuzzy results for %q, got none", "irom")
+	}
+	// The high-frequency correction "iron" must have been selected as a fuzzy
+	// candidate despite being indexed after the rare neighbours, so its docs
+	// must appear in the results.
+	ironDocs := 0
+	for _, d := range res.Docs {
+		if d.ID[0] == 'n' {
+			ironDocs++
+		}
+	}
+	if ironDocs == 0 {
+		t.Fatalf("expected 'iron' docs (n*) in results, got %+v", res.Docs)
+	}
+}
+
+// resultHasDocWithIDPrefix reports whether any returned doc has an ID starting
+// with the given byte.
+func resultHasDocWithIDPrefix(res *SearchResult, prefix byte) bool {
+	if res == nil {
+		return false
+	}
+	for _, d := range res.Docs {
+		if len(d.ID) > 0 && d.ID[0] == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+// addFuzzyRankingDocs upserts four rare ED1 neighbours of "irom" followed by
+// five copies of the common correction "iron", all via incremental upserts so
+// the SymSpell buckets start in insertion (non-frequency) order. Returns the
+// engine for a finalize step (Compact/Save+Load) to re-sort.
+func addFuzzyRankingDocs(t *testing.T, se *SearchEngine) {
+	t.Helper()
+	for _, w := range []string{"irok", "irop", "iroq", "iros"} {
+		if err := se.AddOrUpdateDocument(map[string]interface{}{"id": w, "title": w}); err != nil {
+			t.Fatalf("AddOrUpdateDocument(%q): %v", w, err)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("n%d", i)
+		if err := se.AddOrUpdateDocument(map[string]interface{}{"id": id, "title": "iron"}); err != nil {
+			t.Fatalf("AddOrUpdateDocument(%q): %v", id, err)
+		}
+	}
+}
+
+// TestCompactDeletedSortsFuzzyByFrequency verifies CompactDeleted re-establishes
+// frequency order in the SymSpell buckets: with the fuzzy cap pinned to 1, the
+// misspelled "irom" only resolves to "iron" if "iron" is ranked first.
+func TestCompactDeletedSortsFuzzyByFrequency(t *testing.T) {
+	defer func(v int) { SingleTermMaxFuzzyTokens = v }(SingleTermMaxFuzzyTokens)
+	SingleTermMaxFuzzyTokens = 1
+
+	se := NewSearchEngine([]string{"title"}, nil, nil, 100)
+	addFuzzyRankingDocs(t, se)
+
+	se.CompactDeleted()
+
+	res, err := se.Search(context.Background(), "irom", nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if !resultHasDocWithIDPrefix(res, 'n') {
+		t.Fatalf("expected 'iron' docs (n*) after CompactDeleted, got %+v", res.Docs)
+	}
+}
+
+// TestUpdatePrefixAndFuzzySortsFuzzyByFrequency verifies the maintenance entry
+// point re-establishes frequency order for an incrementally-built engine: with
+// the fuzzy cap pinned to 1, "irom" only resolves to "iron" if the bucket was
+// re-sorted by frequency.
+func TestUpdatePrefixAndFuzzySortsFuzzyByFrequency(t *testing.T) {
+	defer func(v int) { SingleTermMaxFuzzyTokens = v }(SingleTermMaxFuzzyTokens)
+	SingleTermMaxFuzzyTokens = 1
+
+	se := NewSearchEngine([]string{"title"}, nil, nil, 100)
+	addFuzzyRankingDocs(t, se)
+
+	se.UpdatePrefixAndFuzzy()
+
+	res, err := se.Search(context.Background(), "irom", nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if !resultHasDocWithIDPrefix(res, 'n') {
+		t.Fatalf("expected 'iron' docs (n*) after UpdatePrefixAndFuzzy, got %+v", res.Docs)
+	}
+}
+
+// TestLoadAllSortsFuzzyByFrequency verifies the same for the Save+Load finalize
+// path: a freshly loaded engine must rank fuzzy corrections by frequency.
+func TestLoadAllSortsFuzzyByFrequency(t *testing.T) {
+	defer func(v int) { SingleTermMaxFuzzyTokens = v }(SingleTermMaxFuzzyTokens)
+	SingleTermMaxFuzzyTokens = 1
+
+	se := NewSearchEngine([]string{"title"}, nil, nil, 100)
+	addFuzzyRankingDocs(t, se)
+
+	dir := t.TempDir()
+	if err := se.SaveAll(dir); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+	loaded, err := LoadAll(dir)
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+
+	res, err := loaded.Search(context.Background(), "irom", nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if !resultHasDocWithIDPrefix(res, 'n') {
+		t.Fatalf("expected 'iron' docs (n*) after LoadAll, got %+v", res.Docs)
 	}
 }
 
@@ -1382,12 +1532,12 @@ func TestCompactDeleted_RebuildsCurrentIndexOnly(t *testing.T) {
 	}
 
 	before := se.Stats()
-	if before.StoredDocuments != 3 || before.ActiveDocuments != 1 {
+	if before.StoredDocuments != 1 || before.ActiveDocuments != 1 {
 		t.Fatalf("unexpected pre-compact stats: %+v", before)
 	}
 
 	stats := se.CompactDeleted()
-	if stats.BeforeStored != 3 || stats.BeforeActive != 1 || stats.AfterStored != 1 || stats.AfterActive != 1 || stats.RemovedVersions != 2 {
+	if stats.BeforeStored != 1 || stats.BeforeActive != 1 || stats.AfterStored != 1 || stats.AfterActive != 1 || stats.RemovedVersions != 0 {
 		t.Fatalf("unexpected compact stats: %+v", stats)
 	}
 

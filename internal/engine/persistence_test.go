@@ -49,10 +49,10 @@ func TestSaveAll_TombstonesExcluded(t *testing.T) {
 	_ = se.AddOrUpdateDocument(map[string]interface{}{"id": "update", "title": "beta new"}) // supersedes previous
 	se.DeleteDocument("delete")
 
-	// Before save: 4 internal IDs stored (keep=1, update-old=2, delete=3, update-new=4),
-	// but only 2 active (keep, update-new).
-	if len(se.Documents) != 4 {
-		t.Fatalf("expected 4 stored docs before save, got %d", len(se.Documents))
+	// Before save: 2 internal IDs stored (keep, update-new — old update version and delete eagerly removed),
+	// both active.
+	if len(se.Documents) != 2 {
+		t.Fatalf("expected 2 stored docs before save, got %d", len(se.Documents))
 	}
 
 	dir := t.TempDir()

@@ -55,6 +55,7 @@
       <button class="tab-button" data-tab="save" onclick="openTab('save')">Save Index</button>
       <button class="tab-button" data-tab="load" onclick="openTab('load')">Load Index</button>
       <button class="tab-button" data-tab="compact" onclick="openTab('compact')">Compact Index</button>
+      <button class="tab-button" data-tab="updatePrefixAndFuzzy" onclick="openTab('updatePrefixAndFuzzy')">Update Prefix &amp; Fuzzy</button>
     </nav>
     <section id="tab-indexes" class="tab-panel active">
       <h2>Indexes</h2>
@@ -117,6 +118,12 @@
       <label>Index name</label>
       <input id="compactIndex" placeholder="products">
       <p><button onclick="compactIndex()">Compact</button></p>
+    </section>
+    <section id="tab-updatePrefixAndFuzzy" class="tab-panel">
+      <h2>Update Prefix &amp; Fuzzy</h2>
+      <label>Index name</label>
+      <input id="updatePrefixAndFuzzyIndex" placeholder="products">
+      <p><button onclick="updatePrefixAndFuzzy()">Update Prefix &amp; Fuzzy</button></p>
     </section>
     <section>
       <h2>Response</h2>
@@ -242,6 +249,14 @@
         method: 'POST',
         headers: adminHeaders({'Content-Type':'application/json'}),
         body: JSON.stringify({ indexName: document.getElementById('compactIndex').value.trim() })
+      });
+      await refreshIndexes(false);
+    }
+    async function updatePrefixAndFuzzy() {
+      await request('/api/update-prefix-and-fuzzy', {
+        method: 'POST',
+        headers: adminHeaders({'Content-Type':'application/json'}),
+        body: JSON.stringify({ indexName: document.getElementById('updatePrefixAndFuzzyIndex').value.trim() })
       });
       await refreshIndexes(false);
     }

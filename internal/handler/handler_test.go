@@ -161,8 +161,8 @@ func TestListIndexesHandler(t *testing.T) {
 	if products.ActiveDocs != 1 {
 		t.Fatalf("expected products activeDocs=1, got %+v", products)
 	}
-	if products.StoredDocs != 3 {
-		t.Fatalf("expected products storedDocs=3, got %+v", products)
+	if products.StoredDocs != 1 {
+		t.Fatalf("expected products storedDocs=1, got %+v", products)
 	}
 	if products.DeletedVersions != 2 {
 		t.Fatalf("expected products deletedVersions=2, got %+v", products)
@@ -821,12 +821,84 @@ func TestCompactIndexHandler(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode compact response: %v", err)
 	}
-	if resp.Stats.BeforeStored != 3 || resp.Stats.AfterStored != 1 || resp.Stats.RemovedVersions != 2 {
+	if resp.Stats.BeforeStored != 1 || resp.Stats.AfterStored != 1 || resp.Stats.RemovedVersions != 0 {
 		t.Fatalf("unexpected compact stats: %+v", resp.Stats)
 	}
 	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "new", nil), "1")
 	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "old", nil))
 	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "delete", nil))
+}
+
+func TestUpdatePrefixHandler(t *testing.T) {
+	h := NewHTTP()
+	se := engine.NewSearchEngine([]string{"name"}, nil, nil, 10)
+	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "name": "laptop"}); err != nil {
+		t.Fatalf("AddOrUpdateDocument: %v", err)
+	}
+	h.engines["idx"] = se
+
+	req := httptest.NewRequest(http.MethodPost, "/update-prefix", strings.NewReader(`{"indexName":"idx"}`))
+	rr := httptest.NewRecorder()
+	h.UpdatePrefix(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("update-prefix expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp UpdatePrefixResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode update-prefix response: %v", err)
+	}
+	if resp.Status != "success" || resp.IndexName != "idx" {
+		t.Fatalf("unexpected update-prefix response: %+v", resp)
+	}
+	// Prefix lookup still resolves after the rebuild.
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "lap", nil), "1")
+}
+
+func TestUpdatePrefixHandler_NotFound(t *testing.T) {
+	h := NewHTTP()
+	req := httptest.NewRequest(http.MethodPost, "/update-prefix", strings.NewReader(`{"indexName":"missing"}`))
+	rr := httptest.NewRecorder()
+	h.UpdatePrefix(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("update-prefix expected 404, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpdatePrefixAndFuzzyHandler(t *testing.T) {
+	h := NewHTTP()
+	se := engine.NewSearchEngine([]string{"name"}, nil, nil, 10)
+	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "name": "laptop"}); err != nil {
+		t.Fatalf("AddOrUpdateDocument: %v", err)
+	}
+	h.engines["idx"] = se
+
+	req := httptest.NewRequest(http.MethodPost, "/update-prefix-and-fuzzy", strings.NewReader(`{"indexName":"idx"}`))
+	rr := httptest.NewRecorder()
+	h.UpdatePrefixAndFuzzy(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("update-prefix-and-fuzzy expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp UpdatePrefixAndFuzzyResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode update-prefix-and-fuzzy response: %v", err)
+	}
+	if resp.Status != "success" || resp.IndexName != "idx" {
+		t.Fatalf("unexpected update-prefix-and-fuzzy response: %+v", resp)
+	}
+	// Prefix lookup still resolves after the rebuild.
+	assertEngineSearchIDs(t, mustEngineSearch(t, h.engines["idx"], "lap", nil), "1")
+}
+
+func TestUpdatePrefixAndFuzzyHandler_NotFound(t *testing.T) {
+	h := NewHTTP()
+	req := httptest.NewRequest(http.MethodPost, "/update-prefix-and-fuzzy", strings.NewReader(`{"indexName":"missing"}`))
+	rr := httptest.NewRecorder()
+	h.UpdatePrefixAndFuzzy(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("update-prefix-and-fuzzy expected 404, got %d body=%s", rr.Code, rr.Body.String())
+	}
 }
 
 func TestDocumentEndpoints_E2E_AddUpdateDeleteSearch(t *testing.T) {
