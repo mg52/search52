@@ -6,7 +6,12 @@ import (
 )
 
 var (
-	MaxPrefixTerms            = 5_000
+	// MaxPrefixTerms caps how many terms are stored per prefix key. Search reads
+	// at most SingleTermMaxPrefixTokens (single-term) or multiTermPrefixLimit
+	// (multi-term, ≤50) entries from a bucket, so anything stored beyond the
+	// largest of those limits is unreachable and only costs memory. Raise this
+	// (SEARCH52_MAX_PREFIX_TERMS) if you raise those consumer limits past 64.
+	MaxPrefixTerms            = 64
 	SkipUpdatePrefix          = false
 	ExactMatchBoost           = 10
 	SingleTermMaxPrefixTokens = 3

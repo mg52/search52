@@ -114,17 +114,38 @@ func (s *SymSpell) removeFrom(key, word string) {
 // hold se.mu.RLock().
 func (s *SymSpell) FuzzySearch(query string, maxReturnCount int) []string {
 	results := []string{}
-	seen := make(map[string]struct{})
+
+	// Bounded queries (the search hot path uses limits ≤ 50) dedupe with a
+	// linear scan over the small result slice; only unbounded/large requests
+	// pay for a map allocation.
+	var seen map[string]struct{}
+	if maxReturnCount <= 0 || maxReturnCount > 64 {
+		seen = make(map[string]struct{})
+	}
+	isDup := func(w string) bool {
+		if seen != nil {
+			if _, dup := seen[w]; dup {
+				return true
+			}
+			seen[w] = struct{}{}
+			return false
+		}
+		for _, r := range results {
+			if r == w {
+				return true
+			}
+		}
+		return false
+	}
 
 	add := func(key string) bool {
 		for _, w := range s.DeleteMap[key] {
 			if w == query {
 				continue
 			}
-			if _, dup := seen[w]; dup {
+			if isDup(w) {
 				continue
 			}
-			seen[w] = struct{}{}
 			results = append(results, w)
 			if maxReturnCount > 0 && len(results) >= maxReturnCount {
 				return true

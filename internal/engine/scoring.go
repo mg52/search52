@@ -49,7 +49,7 @@ func weightedTokenScores(doc map[string]interface{}, indexFields []string, field
 		var tokens []string
 		switch v := value.(type) {
 		case string:
-			tokens = append(tokens, Tokenize(v)...)
+			tokens = Tokenize(v)
 		case []string:
 			for _, item := range v {
 				tokens = append(tokens, Tokenize(item)...)
