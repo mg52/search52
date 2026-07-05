@@ -26,6 +26,14 @@ var (
 	AIMaxCategoriesPerDoc = 3
 	AIMaxCategories       = 100
 	AIEmbedConcurrency    = 8 // parallel embedding calls during bulk categorization
+
+	// AIParallelSearchMinTokens is the minimum query token count at which the
+	// AI vector/category search runs in parallel alongside the classic search.
+	// Below this, Search runs classic-only.
+	AIParallelSearchMinTokens = 2
+	// AISearchTopNCategories is how many nearest categories the AI vector
+	// search scans for candidate documents.
+	AISearchTopNCategories = 3
 )
 
 func init() {
@@ -76,6 +84,16 @@ func init() {
 	if v := os.Getenv("SEARCH52_AI_EMBED_CONCURRENCY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			AIEmbedConcurrency = n
+		}
+	}
+	if v := os.Getenv("SEARCH52_AI_PARALLEL_SEARCH_MIN_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			AIParallelSearchMinTokens = n
+		}
+	}
+	if v := os.Getenv("SEARCH52_AI_SEARCH_TOP_N_CATEGORIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			AISearchTopNCategories = n
 		}
 	}
 }

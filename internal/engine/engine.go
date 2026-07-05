@@ -32,6 +32,7 @@ type ReturnedDocument struct {
 	ID    string
 	Data  map[string]interface{}
 	Score int
+	AI    bool // true if this hit came from the AI vector/category search, not the inverted index
 }
 
 type SearchResult struct {
@@ -1286,15 +1287,51 @@ func (se *SearchEngine) ApplyFilterLocked(filters map[string][]interface{}) []ui
 }
 
 // Search executes a query (single or multi-term), selecting between exact/prefix/fuzzy strategies.
+// When AI is enabled and the query has at least AIParallelSearchMinTokens tokens,
+// the AI vector/category search runs concurrently with the classic search and
+// its hits (ReturnedDocument.AI == true) are appended to the classic results —
+// no merge/rerank algorithm, just concatenation, per current design.
 func (se *SearchEngine) Search(ctx context.Context, query string, filters map[string][]interface{}) (*SearchResult, error) {
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil, nil
-	} else if len(queryTokens) == 1 {
-		return se.SingleTermSearch(ctx, queryTokens, filters)
-	} else {
-		return se.MultiTermSearch(ctx, queryTokens, filters)
 	}
+
+	classicSearch := se.SingleTermSearch
+	if len(queryTokens) > 1 {
+		classicSearch = se.MultiTermSearch
+	}
+
+	if !se.AIEnabled() || len(queryTokens) < AIParallelSearchMinTokens {
+		return classicSearch(ctx, queryTokens, filters)
+	}
+
+	var classicResult *SearchResult
+	var classicErr error
+	var aiDocs []ReturnedDocument
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		classicResult, classicErr = classicSearch(ctx, queryTokens, filters)
+	}()
+	go func() {
+		defer wg.Done()
+		aiDocs = se.aiVectorSearch(ctx, query, filters)
+	}()
+	wg.Wait()
+
+	if classicErr != nil {
+		return nil, classicErr
+	}
+	if classicResult == nil {
+		classicResult = &SearchResult{}
+	}
+	if len(aiDocs) > 0 {
+		classicResult.Docs = append(classicResult.Docs, aiDocs...)
+	}
+	return classicResult, nil
 }
 
 func (se *SearchEngine) SingleTermSearch(

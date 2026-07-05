@@ -304,6 +304,64 @@ func TestAIEndToEnd_DocumentPersistLoad(t *testing.T) {
 	}
 }
 
+// TestSearchHandler_MergesAIHits drives a real HTTP /search request against an
+// AI-enabled index and confirms the JSON response carries the AI-sourced hit
+// (with "AI":true) alongside the classic hit, proving the merge in
+// engine.Search reaches all the way through the HTTP layer.
+func TestSearchHandler_MergesAIHits(t *testing.T) {
+	srv := newEmbeddingTestServer(t, map[string][]float32{
+		"car":     {1, 0, 0, 0},
+		"bicycle": {0, 1, 0, 0},
+		"vehicle": {1, 0, 0, 0}, // query-only synonym for car
+	})
+	setEmbeddingEnv(t, srv.URL)
+
+	ht := NewHTTP()
+	const idx = "aidx"
+	createAIIndex(t, ht, idx)
+
+	for _, doc := range []string{
+		`{"document":{"id":"1","name":"red car"}}`,
+		`{"document":{"id":"2","name":"blue bicycle"}}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/document?indexName="+idx, strings.NewReader(doc))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		ht.AddOrUpdateDocument(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("document upsert status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+	}
+
+	// "fast vehicle": neither token is indexed, so classic search alone would
+	// return nothing; "vehicle" embeds to the car vector, so AI must surface
+	// doc 1 on its own.
+	req := httptest.NewRequest(http.MethodGet, "/search?index="+idx+"&q=fast+vehicle", nil)
+	rr := httptest.NewRecorder()
+	ht.Search(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("search status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	body := rr.Body.String()
+	var resp SearchResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Response == nil || len(resp.Response.Docs) != 1 {
+		t.Fatalf("Docs = %+v, want exactly 1 AI hit", resp.Response)
+	}
+	if got := resp.Response.Docs[0]; got.ID != "1" || !got.AI {
+		t.Fatalf("got %+v, want AI hit for doc 1", got)
+	}
+
+	// Confirm the raw JSON actually carries the literal "AI":true key (not
+	// silently dropped or renamed by an unexpected json tag).
+	if !strings.Contains(body, `"AI":true`) {
+		t.Fatalf("response JSON missing \"AI\":true: %s", body)
+	}
+}
+
 // TestAddToIndex_AICategorizes verifies the bulk upload path (multipart file →
 // Index → CategorizeDocs) also embeds and categorizes.
 func TestAddToIndex_AICategorizes(t *testing.T) {

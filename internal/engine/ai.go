@@ -17,6 +17,11 @@ type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float32, error)
 }
 
+// aiScoreScale converts a cosine similarity in [-1,1] to the integer score the
+// min-heap orders on. 1e6 keeps ~6 significant digits, far more than embedding
+// similarities can meaningfully distinguish.
+const aiScoreScale = 1e6
+
 // AIDocument is a document's embedding plus the categories it clustered into.
 // It is keyed by the EXTERNAL doc ID: updates of a document reuse the same
 // external ID (while the engine's internal uint32 ID churns), and the embedding
@@ -48,6 +53,14 @@ type Category struct {
 // existing category whose cosine similarity is >= threshold (highest first,
 // capped at maxPerDoc), or seeds a new category when none are close enough
 // (capped by maxCategories).
+//
+// LOCK ORDER INVARIANT: when both locks are needed, acquire se.mu BEFORE
+// ai.mu (DeleteDocument and aiVectorSearch nest this way). Never acquire
+// se.mu while holding ai.mu — that would deadlock against them. Writes that
+// need engine state first (CategorizeDocument, clusterDoc) read it under
+// se.mu, RELEASE it, then take ai.mu; the resulting staleness window is
+// closed on the read side, where aiVectorSearch re-validates every candidate
+// against ExternalToInternal/DocDeleted before returning it.
 type AIIndex struct {
 	embedder Embedder
 
@@ -296,6 +309,138 @@ func (se *SearchEngine) CategorizeDocs(ctx context.Context, docs []map[string]in
 	}
 	flush()
 	return ok, failed
+}
+
+// aiVectorSearch embeds query, selects the AISearchTopNCategories nearest
+// categories, and ranks their member documents by cosine similarity to the
+// query.
+//
+// Locking: the embed call (network) happens with no lock held; the scan then
+// holds se.mu.RLock with ai.mu.RLock nested inside. That nesting order matches
+// DeleteDocument (se.mu → ai.mu), so it cannot deadlock.
+func (se *SearchEngine) aiVectorSearch(ctx context.Context, query string, filters map[string][]interface{}) []ReturnedDocument {
+	ai := se.AI
+	if ai == nil || ai.embedder == nil {
+		return nil
+	}
+
+	qv, err := ai.embedder.Embed(ctx, query)
+	if err != nil {
+		slog.Error("ai vector search: embed query failed", "error", err)
+		return nil
+	}
+	qn := vec.Norm(qv)
+	if qn == 0 {
+		return nil
+	}
+
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	k := se.ResultSize
+	if k <= 0 {
+		return nil
+	}
+
+	var allowed []uint64
+	if len(filters) > 0 {
+		allowed = se.ApplyFilterLocked(filters)
+		if allowed == nil {
+			return nil
+		}
+	}
+
+	ai.mu.RLock()
+	defer ai.mu.RUnlock()
+
+	topN := AISearchTopNCategories
+	catNames := make([]string, 0, topN)
+	ch := make([]internalHit, 0, topN)
+	for name, c := range ai.categories {
+		if c.Norm == 0 {
+			continue
+		}
+		sim := vec.Cosine(qv, c.Centroid, qn, c.Norm)
+		score := int(sim * aiScoreScale)
+		if len(ch) < topN {
+			catNames = append(catNames, name)
+			ch = heapPushHit(ch, internalHit{id: uint32(len(catNames) - 1), score: score})
+		} else if ch[0].score < score {
+			slot := ch[0].id
+			catNames[slot] = name
+			heapReplaceTop(ch, internalHit{id: slot, score: score})
+		}
+	}
+	if len(ch) == 0 {
+		return nil
+	}
+
+	type docHit struct {
+		extID      string
+		internalID uint32
+		sim        float32
+	}
+	docCands := make([]docHit, 0, k)
+	dh := make([]internalHit, 0, k)
+	seen := make(map[string]struct{})
+	for _, hit := range ch {
+		for extID := range ai.catDocs[catNames[hit.id]] {
+			if _, dup := seen[extID]; dup {
+				continue
+			}
+			seen[extID] = struct{}{}
+			doc, ok := ai.docs[extID]
+			if !ok || doc.Norm == 0 {
+				continue
+			}
+			// Reject dead and filtered-out documents here, not after the heap:
+			// they must not consume one of the k result slots.
+			internalID, live := se.ExternalToInternal[extID]
+			if !live || se.DocDeleted[internalID] {
+				continue // deleted/updated since it was embedded
+			}
+			if allowed != nil && !filterBitTest(allowed, internalID) {
+				continue
+			}
+			sim := vec.Cosine(qv, doc.Vector, qn, doc.Norm)
+			if sim <= 0 {
+				continue // irrelevant to the query
+			}
+			score := int(sim * aiScoreScale)
+			if len(dh) < k {
+				docCands = append(docCands, docHit{extID, internalID, sim})
+				dh = heapPushHit(dh, internalHit{id: uint32(len(docCands) - 1), score: score})
+			} else if dh[0].score < score {
+				slot := dh[0].id
+				docCands[slot] = docHit{extID, internalID, sim}
+				heapReplaceTop(dh, internalHit{id: slot, score: score})
+			}
+		}
+	}
+
+	n := len(dh)
+	if n == 0 {
+		return nil
+	}
+
+	// Drain the min-heap back-to-front so out is ordered highest score first,
+	// matching the classic search loops.
+	out := make([]ReturnedDocument, n)
+	for i := n - 1; i >= 0; i-- {
+		hit := dh[0]
+		if i > 0 {
+			dh[0] = dh[i]
+			siftDownHit(dh, 0, i)
+		}
+		cand := docCands[hit.id]
+		out[i] = ReturnedDocument{
+			ID:    cand.extID,
+			Data:  se.Documents[cand.internalID],
+			Score: int(cand.sim * aiScoreScale),
+			AI:    true,
+		}
+	}
+	return out
 }
 
 // RemoveDocument deletes a document's embedding and detaches it from every
