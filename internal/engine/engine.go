@@ -103,6 +103,11 @@ type SearchEngine struct {
 	// Popularity: StaticPopularity comes from the doc's "popularity" field at index time.
 	StaticPopularity map[string]int // externalID → static popularity score
 
+	// AI is the optional embedding/categorization index (nil when disabled).
+	// It has its own mutex and is keyed by external doc ID, so it is not
+	// affected by internal-ID churn or CompactDeleted.
+	AI *AIIndex
+
 	// termSet is a lock-free set of all indexed terms, used for O(1) existence
 	// checks in the search path without touching se.mu. Stored as an atomic
 	// pointer so CompactDeleted can swap the entire map without a data race.
@@ -235,6 +240,13 @@ func (se *SearchEngine) SaveAll(path string) error {
 	if err := os.Rename(tmpFile, engineFile); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("rename %s to %s: %w", tmpFile, engineFile, err)
+	}
+
+	// Persist embeddings + categories alongside the document snapshot.
+	if se.AIEnabled() {
+		if err := se.PersistCategoryEmbed(path); err != nil {
+			return fmt.Errorf("persist category embed: %w", err)
+		}
 	}
 
 	return nil
@@ -404,6 +416,14 @@ func LoadAll(path string) (*SearchEngine, error) {
 	}
 	se.termSet.Store(newTermSet)
 
+	// Restore embeddings + categories if a category_embed.gob snapshot exists.
+	// The embedder is not persisted; the caller re-attaches one via EnableAI.
+	ai, err := loadCategoryEmbed(path)
+	if err != nil {
+		return nil, fmt.Errorf("load category embed: %w", err)
+	}
+	se.AI = ai
+
 	return se, nil
 }
 
@@ -443,6 +463,13 @@ func (se *SearchEngine) Index(docs []map[string]interface{}) {
 	start = time.Now()
 	se.SortSymspellByFrequency()
 	slog.Info("SortSymspellByFrequency done", "duration", time.Since(start))
+
+	if se.AIEnabled() {
+		slog.Info("CategorizeDocs starting")
+		start = time.Now()
+		ok, failed := se.CategorizeDocs(context.Background(), docs)
+		slog.Info("CategorizeDocs done", "categorized", ok, "failed", failed, "duration", time.Since(start))
+	}
 }
 
 // SortSymspellByFrequency orders the SymSpell delete buckets by descending term
@@ -1485,6 +1512,14 @@ func (se *SearchEngine) AddOrUpdateDocument(doc map[string]interface{}) error {
 
 	se.mu.Unlock()
 
+	// Embed + categorize outside se.mu (network call; AIIndex has its own lock).
+	// A failure here leaves the document searchable but uncategorized.
+	if se.AIEnabled() {
+		if err := se.CategorizeDocument(context.Background(), extID, doc); err != nil {
+			slog.Error("ai categorize failed", "doc", extID, "error", err)
+		}
+	}
+
 	return nil
 }
 
@@ -1511,6 +1546,10 @@ func (se *SearchEngine) DeleteDocument(externalID string) bool {
 	delete(se.ExternalToInternal, externalID)
 	delete(se.InternalToExternal, internal)
 	delete(se.StaticPopularity, externalID)
+
+	if se.AI != nil {
+		se.AI.RemoveDocument(externalID)
+	}
 
 	return true
 }

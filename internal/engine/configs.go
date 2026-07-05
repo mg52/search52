@@ -18,6 +18,14 @@ var (
 	SingleTermMaxFuzzyTokens  = 2
 	SingleTermSkipWholeScan   = false
 	MultiTermSkipWholeScan    = false
+
+	// AI categorization knobs (only used when an index is created with AI
+	// enabled). Threshold is the min cosine similarity for a document to join
+	// an existing category; below it the document seeds a new category.
+	AICategoryThreshold   = 0.60
+	AIMaxCategoriesPerDoc = 3
+	AIMaxCategories       = 100
+	AIEmbedConcurrency    = 8 // parallel embedding calls during bulk categorization
 )
 
 func init() {
@@ -49,6 +57,26 @@ func init() {
 	}
 	if v := os.Getenv("SEARCH52_MULTI_TERM_SKIP_WHOLE_SCAN"); v != "" {
 		MultiTermSkipWholeScan = v == "true" || v == "1"
+	}
+	if v := os.Getenv("SEARCH52_AI_CATEGORY_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			AICategoryThreshold = f
+		}
+	}
+	if v := os.Getenv("SEARCH52_AI_MAX_CATEGORIES_PER_DOC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			AIMaxCategoriesPerDoc = n
+		}
+	}
+	if v := os.Getenv("SEARCH52_AI_MAX_CATEGORIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			AIMaxCategories = n
+		}
+	}
+	if v := os.Getenv("SEARCH52_AI_EMBED_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			AIEmbedConcurrency = n
+		}
 	}
 }
 
