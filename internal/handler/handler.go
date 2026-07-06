@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mg52/search52/internal/embed"
 	"github.com/mg52/search52/internal/engine"
 )
 
@@ -70,6 +72,7 @@ type CreateIndexRequest struct {
 	FieldWeights map[string]int `json:"fieldWeights"`
 	Filters      []string       `json:"filters"`
 	ResultCount  int            `json:"resultCount"`
+	AIEnabled    bool           `json:"aiEnabled"`
 }
 
 // CreateIndexResponse is returned on succressful index creation.
@@ -493,6 +496,18 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 		filterMap[f] = true
 	}
 
+	// Resolve the embedder before creating anything so a misconfigured
+	// environment fails the request instead of leaving a half-AI index.
+	var embedder engine.Embedder
+	if req.AIEnabled {
+		client, err := embed.NewEmbeddingClientFromEnv()
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, err)
+			return
+		}
+		embedder = client
+	}
+
 	start := time.Now()
 	sec := engine.NewSearchEngine(
 		req.IndexFields,
@@ -500,6 +515,9 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 		filterMap,
 		req.ResultCount,
 	)
+	if embedder != nil {
+		sec.EnableAI(embedder)
+	}
 	elapsed := time.Since(start)
 
 	ht.mu.Lock()
@@ -665,6 +683,58 @@ func (ht *HTTP) SaveEngine(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// PersistCategoryEmbed persists ONLY the AI state (per-document embeddings and
+// categories) of the named engine, without rewriting the document snapshot.
+func (ht *HTTP) PersistCategoryEmbed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("unsupported method"))
+		return
+	}
+	var req SaveEngineRequest
+	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+	ht.mu.RLock()
+	sec, ok := ht.engines[req.IndexName]
+	ht.mu.RUnlock()
+	if !ok {
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
+		return
+	}
+	if !sec.AIEnabled() {
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("index %q does not have AI enabled", req.IndexName))
+		return
+	}
+
+	baseDir := os.Getenv("SEARCH52_INDEX_DATA_DIR")
+	if baseDir == "" {
+		baseDir = "./data"
+	}
+	dataDir := filepath.Join(baseDir, req.IndexName)
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to create data dir: %w", err))
+		return
+	}
+	if err := sec.PersistCategoryEmbed(dataDir); err != nil {
+		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to persist category embed: %w", err))
+		return
+	}
+	resp := SaveEngineResponse{
+		Status:     "success",
+		StatusCode: http.StatusOK,
+		IndexName:  req.IndexName,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}
+
 func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -693,6 +763,19 @@ func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to load index %q; existing in-memory index was left unchanged: %w", req.IndexName, err))
 		return
+	}
+
+	// A category_embed.gob snapshot restores AI state without the embedder
+	// (it is not serializable); re-attach one from the environment so future
+	// writes keep categorizing. Search works either way, so a missing
+	// embedding config only logs a warning.
+	if eng.AIEnabled() {
+		client, embErr := embed.NewEmbeddingClientFromEnv()
+		if embErr != nil {
+			slog.Warn("loaded AI-enabled index without embedding config; new documents will not be categorized", "index", req.IndexName, "error", embErr)
+		} else {
+			eng.EnableAI(client)
+		}
 	}
 
 	ht.mu.Lock()

@@ -10,8 +10,9 @@ A lightweight, fast, in-memory inverted-index search engine with HTTP handlers a
 - **Prefix & fuzzy matching** — prefix map for instant completions + SymSpell for Levenshtein fuzzy suggestions  
 - **Filters** on arbitrary document fields (OR within a field, AND across fields)  
 - **Popularity ranking** — a static `popularity` field boosts search scores  
+- **Optional AI categorization & vector search** — embeds documents via an OpenAI-compatible endpoint, incrementally clusters them into categories, and runs a parallel vector search on multi-word queries whose hits are merged into the classic results  
 - **HTTP API** for index creation, search, single-doc upsert/delete, bulk add  
-- **Persistence** — saves documents + metadata + popularity and rebuilds all derived indexes on load  
+- **Persistence** — saves documents + metadata + popularity and rebuilds all derived indexes on load; AI embeddings/categories persist to a separate snapshot  
 - **Docker-ready** — runs as an unprivileged user, persists under a mounted volume  
 
 ---
@@ -37,39 +38,15 @@ Index/load summary:
 
 HTTP load-test results:
 
-The load-test client drains each response body before recording latency.
+16 workers, 100000 queries in 1 minute 3 seconds.
 
-| Scope | Workers | Queries | Errors | Client errors | HTTP statuses | Wall time | RPS | avg | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| Overall | 16 | 100000 | 0 | 0 | {200:100000} | 1m3.425s | 1576.7 | 10.12ms | 4.62ms | 32.03ms | 90.71ms |
-| Single / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.96ms | 4.30ms | 24.96ms | 54.66ms |
-| Single / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.70ms | 3.51ms | 24.38ms | 60.46ms |
-| Multi / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 16.89ms | 6.60ms | 58.06ms | 177.62ms |
-| Multi / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.94ms | 4.24ms | 26.09ms | 53.91ms |
-
-### In-process benchmark
-
-This benchmark runs entirely inside the Go process: it loads a JSON dataset, builds the engine in memory, warms up query paths, and measures search latency without HTTP/network overhead.
-
-#### 1 M docs — heap delta ~800 MB
-
-| Mode | avg | p50 | p99 | B/op | allocs/op |
-|---|---:|---:|---:|---:|---:|
-| SingleTerm / NoFilter | 29.4 µs | 21.2 µs |  88.9 µs | 14 136 | 10 |
-| SingleTerm / Filter   |  8.8 µs |  6.6 µs |  26.1 µs |  3 457 | 13 |
-| MultiTerm  / NoFilter | 16.6 µs | 12.9 µs |  73.2 µs |  2 831 | 25 |
-| MultiTerm  / Filter   | 12.7 µs | 12.1 µs |  32.8 µs |  2 862 | 27 |
-
-#### 5 M docs — heap delta ~2 773 MB
-
-| Mode | avg | p50 | p99 | B/op | allocs/op |
-|---|---:|---:|---:|---:|---:|
-| SingleTerm / NoFilter | 67.7 µs | 40.4 µs | 318.6 µs | 14 148 | 10 |
-| SingleTerm / Filter   | 53.3 µs | 36.5 µs | 230.7 µs |  6 715 | 13 |
-| MultiTerm  / NoFilter | 82.0 µs | 41.8 µs | 594.6 µs |  3 472 | 25 |
-| MultiTerm  / Filter   | 46.9 µs | 43.0 µs | 173.9 µs |  3 492 | 27 |
-
-Filter queries are faster than no-filter equivalents because the bitset pre-prunes the candidate set before the posting-list scan.
+| Scope | avg | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| Overall | 10.12ms | 4.62ms | 32.03ms | 90.71ms |
+| Single / NoFilter | 7.96ms | 4.30ms | 24.96ms | 54.66ms |
+| Single / Filter | 7.70ms | 3.51ms | 24.38ms | 60.46ms |
+| Multi / NoFilter | 16.89ms | 6.60ms | 58.06ms | 177.62ms |
+| Multi / Filter | 7.94ms | 4.24ms | 26.09ms | 53.91ms |
 
 Bench tooling documentation lives in [cmd/bench/README.md](cmd/bench/README.md)
 
@@ -224,6 +201,29 @@ During search, `staticPop[extID]` is added to the boosted term score before the 
 
 `SaveAll` serialises only the active document store, metadata (field config), and the popularity map to a single gob file — tombstoned versions are never written. `LoadAll` restores the documents and popularity, then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `SymSpell`, and the ID maps — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change. If `engine.gob` is corrupt or fails validation during the HTTP load endpoint, the existing in-memory index is left unchanged and the endpoint returns a clear error.
 
+### 10. AI Categorization & Vector Search (optional)
+
+An index created with `"aiEnabled": true` additionally embeds every document via an OpenAI-compatible `/embeddings` endpoint (OpenAI itself, or anything that mirrors its API, e.g. Ollama) and incrementally clusters it into categories — a separate subsystem (`AIIndex`) that never blocks or is blocked by the classic inverted index:
+
+```go
+type AIIndex struct {
+    docs           map[string]AIDocument          // external doc ID -> embedding + categories
+    categories     map[string]*Category           // name -> centroid (running vector sum)
+    catDocs        map[string]map[string]struct{} // category name -> member doc IDs
+    nextCategoryID int
+}
+```
+
+**Categorization**: a document's index-field values are joined into one string and embedded. It joins every existing category whose cosine similarity to the category's centroid is ≥ `SEARCH52_AI_CATEGORY_THRESHOLD` (default `0.60`), highest similarity first, up to `SEARCH52_AI_MAX_CATEGORIES_PER_DOC` (default `3`) categories. If none qualify, it seeds a new category — unless `SEARCH52_AI_MAX_CATEGORIES` (default `100`) is already reached, in which case it joins the single nearest category regardless of threshold. A category's centroid stores the running **sum** of its member vectors (cosine similarity is scale-invariant, so the sum ranks identically to the mean), which also keeps member removal exact on document update/delete.
+
+Bulk indexing embeds documents in batches of 256, with `SEARCH52_AI_EMBED_CONCURRENCY` (default `8`) embedding requests in flight per batch; each batch is then clustered sequentially in input order, so category discovery is deterministic for a given input. Per-document embedding failures are logged and skipped — the document stays fully searchable via the classic index, just uncategorized.
+
+**Search integration**: `Search` runs the AI vector search *in parallel* with the classic search once the query has at least `SEARCH52_AI_PARALLEL_SEARCH_MIN_TOKENS` (default `2`) tokens. The vector search embeds the query, selects the `SEARCH52_AI_SEARCH_TOP_N_CATEGORIES` (default `3`) nearest categories by centroid similarity, and ranks their member documents by cosine similarity to the query — both steps use the same bounded min-heap technique as §5. It applies the same filter bitset as the classic path, so a filtered-out document never occupies a result slot. Its hits are **appended** to the classic results — by design there is no merge, rerank, or dedup — and are distinguishable via `ReturnedDocument.AI == true`. Below the token threshold, or when AI is disabled, `Search` runs classic-only with zero AI overhead.
+
+**Concurrency**: `AIIndex` holds its own `RWMutex`, independent of the engine's, so clustering (CPU-bound vector math) and embedding (network I/O) never contend with classic search or indexing. When both locks are needed, lock order is always engine-mutex-then-AI-mutex, never the reverse, so cross-lock deadlock is structurally impossible. This ordering opens a brief eventual-consistency window (a just-written document may not be AI-clusterable yet); the read side closes it by re-validating every AI hit against the live document map before returning it, so a stale or deleted candidate is silently dropped rather than surfaced.
+
+**Persistence**: embeddings and categories are written to a separate `category_embed.gob` file, independent of `engine.gob`. `PersistCategoryEmbed` (`POST /persist-category-embed`) writes only this file, without touching the document snapshot; `SaveAll` writes both files when AI is enabled. The embedder itself is never serialized — `LoadAll` restores vectors and categories as inert data, and the caller must reattach a live embedder via `EnableAI`. The HTTP layer does this automatically on `/load-controller`, constructing the embedder from `SEARCH52_EMBEDDING_*` env vars; if that config is missing it logs a warning and leaves the index searchable (classic-only) rather than failing the load.
+
 ---
 
 ## HTTP API
@@ -249,6 +249,7 @@ Protected endpoints:
 - `POST /document`
 - `DELETE /document`
 - `POST /save-controller`
+- `POST /persist-category-embed`
 - `POST /load-controller`
 - `POST /compact-index`
 
@@ -270,6 +271,22 @@ curl -X POST http://localhost:8080/create-index \
     "resultCount": 10
   }'
 ```
+
+Pass `"aiEnabled": true` to additionally embed and categorize every document (see [§10](#10-ai-categorization--vector-search-optional)):
+
+```bash
+curl -X POST http://localhost:8080/create-index \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: local-dev-key' \
+  -d '{
+    "indexName":   "products",
+    "indexFields": ["name", "tags"],
+    "resultCount": 10,
+    "aiEnabled":   true
+  }'
+```
+
+This requires an embedding endpoint configured in the service environment: `SEARCH52_EMBEDDING_BASE_URL` and `SEARCH52_EMBEDDING_MODEL` are required, `SEARCH52_EMBEDDING_API_KEY` is optional (e.g. for a local Ollama server). If they are missing, `create-index` returns `400 Bad Request` and no index is created.
 
 ### 2. List Indexes
 
@@ -346,6 +363,8 @@ curl 'http://localhost:8080/search?index=products&q=laptop&filter=year:2020,year
 
 Search requests use a 10 second context timeout. If a query exceeds that budget, the endpoint returns `504 Gateway Timeout`.
 
+On an AI-enabled index, a query with at least `SEARCH52_AI_PARALLEL_SEARCH_MIN_TOKENS` tokens (2 by default) also runs the vector/category search described in [§10](#10-ai-categorization--vector-search-optional) and appends its hits to `response.docs`. Each document in the response carries an `"AI"` field: `true` for a vector-search hit, `false` for a classic inverted-index hit. Filters apply identically to both; there is no dedup between them, so the same document can appear twice if both paths find it.
+
 ### 5. Add or Update Single Document
 
 ```bash
@@ -375,9 +394,20 @@ curl -X POST http://localhost:8080/save-controller \
   -d '{ "indexName": "products" }'
 ```
 
-Indexes are saved under `$SEARCH52_INDEX_DATA_DIR/<indexName>/engine.gob`; if `SEARCH52_INDEX_DATA_DIR` is not set, the service uses `./data`.
+Indexes are saved under `$SEARCH52_INDEX_DATA_DIR/<indexName>/engine.gob`; if `SEARCH52_INDEX_DATA_DIR` is not set, the service uses `./data`. If AI is enabled on the index, this also writes `category_embed.gob` alongside it (see below).
 
-### 8. Load Index
+### 8. Persist Category Embed (AI)
+
+```bash
+curl -X POST http://localhost:8080/persist-category-embed \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Key: local-dev-key' \
+  -d '{ "indexName": "products" }'
+```
+
+Writes **only** the AI state — per-document embeddings and categories — to `$SEARCH52_INDEX_DATA_DIR/<indexName>/category_embed.gob`, without touching the document snapshot (`engine.gob`). Useful for checkpointing embeddings on their own cadence, independent of how often documents are saved. Returns `400 Bad Request` if the index does not have AI enabled.
+
+### 9. Load Index
 
 ```bash
 curl -X POST http://localhost:8080/load-controller \
@@ -386,9 +416,9 @@ curl -X POST http://localhost:8080/load-controller \
   -d '{ "indexName": "products" }'
 ```
 
-Load is rollback-safe: a corrupt or invalid `engine.gob` does not replace an already-loaded in-memory index.
+Load is rollback-safe: a corrupt or invalid `engine.gob` does not replace an already-loaded in-memory index. If a `category_embed.gob` snapshot exists, its embeddings and categories are restored too, and the service reattaches a live embedder from the `SEARCH52_EMBEDDING_*` environment variables so newly indexed documents keep getting categorized; if that config is missing, the index loads successfully but stays classic-only (a warning is logged).
 
-### 9. Compact Index
+### 10. Compact Index
 
 ```bash
 curl -X POST http://localhost:8080/compact-index \
@@ -399,7 +429,7 @@ curl -X POST http://localhost:8080/compact-index \
 
 Compaction removes tombstoned old document versions from all postings, filters, prefix arrays, and fuzzy data, and reassigns internal IDs densely from 1. Popularity scores are preserved. The response includes before/after active and stored document counts plus the number of removed versions.
 
-### 10. Health Check
+### 11. Health Check
 
 ```bash
 curl http://localhost:8080/health
