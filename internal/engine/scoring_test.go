@@ -37,22 +37,6 @@ func TestWeightedFieldsAffectRanking(t *testing.T) {
 	if res[0].Score <= res[1].Score {
 		t.Fatalf("expected title hit score > description hit score, got %+v", res)
 	}
-
-	dir := t.TempDir()
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-	loaded, err := LoadAll(dir)
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-	if loaded.FieldWeights["title"] != 5 || loaded.FieldWeights["description"] != 1 {
-		t.Fatalf("field weights not restored: %+v", loaded.FieldWeights)
-	}
-	res = mustSingleTermSearchLoop(t, loaded, "apple", nil)
-	if len(res) != 2 || res[0].ID != "title-hit" || res[0].Score <= res[1].Score {
-		t.Fatalf("loaded weighted ranking mismatch: %+v", res)
-	}
 }
 
 func TestNormalizeFieldWeightsDefaultsInvalidAndExtraWeights(t *testing.T) {

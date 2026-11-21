@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -138,57 +136,6 @@ type ListIndexesResponse struct {
 	Indexes    []IndexInfo `json:"indexes"`
 }
 
-type SaveEngineResponse struct {
-	Status     string `json:"status"`
-	StatusCode int    `json:"statusCode"`
-	IndexName  string `json:"indexName"`
-}
-
-type LoadEngineResponse struct {
-	Status     string `json:"status"`
-	StatusCode int    `json:"statusCode"`
-	IndexName  string `json:"indexName"`
-	Duration   string `json:"duration"`
-	DurationMs int64  `json:"durationMs"`
-}
-
-type CompactIndexRequest struct {
-	IndexName string `json:"indexName"`
-}
-
-type CompactIndexResponse struct {
-	Status     string              `json:"status"`
-	StatusCode int                 `json:"statusCode"`
-	IndexName  string              `json:"indexName"`
-	Stats      engine.CompactStats `json:"stats"`
-	Duration   string              `json:"duration"`
-	DurationMs int64               `json:"durationMs"`
-}
-
-type UpdatePrefixRequest struct {
-	IndexName string `json:"indexName"`
-}
-
-type UpdatePrefixResponse struct {
-	Status     string `json:"status"`
-	StatusCode int    `json:"statusCode"`
-	IndexName  string `json:"indexName"`
-	Duration   string `json:"duration"`
-	DurationMs int64  `json:"durationMs"`
-}
-
-type UpdatePrefixAndFuzzyRequest struct {
-	IndexName string `json:"indexName"`
-}
-
-type UpdatePrefixAndFuzzyResponse struct {
-	Status     string `json:"status"`
-	StatusCode int    `json:"statusCode"`
-	IndexName  string `json:"indexName"`
-	Duration   string `json:"duration"`
-	DurationMs int64  `json:"durationMs"`
-}
-
 type HealthResponse struct {
 	Status     string `json:"status"`
 	StatusCode int    `json:"statusCode"`
@@ -245,6 +192,9 @@ func validateIdentifier(kind, value string, maxLen int) error {
 	}
 	if !identifierPattern.MatchString(value) {
 		return fmt.Errorf("`%s` may only contain letters, numbers, underscore, dash and dot", kind)
+	}
+	if strings.Trim(value, ".") == "" {
+		return fmt.Errorf("`%s` must contain more than dots", kind)
 	}
 	return nil
 }
@@ -608,111 +558,6 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// SaveEngineRequest is the payload for saving an engine to disk.
-type SaveEngineRequest struct {
-	IndexName string `json:"indexName"`
-}
-
-// LoadEngineRequest is the payload for loading an engine from disk.
-type LoadEngineRequest struct {
-	IndexName string `json:"indexName"`
-}
-
-// SaveEngine persists all files for the named engine.
-func (ht *HTTP) SaveEngine(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("unsupported method"))
-		return
-	}
-	var req SaveEngineRequest
-	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	ht.mu.RLock()
-	sec, ok := ht.engines[req.IndexName]
-	ht.mu.RUnlock()
-	if !ok {
-		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
-		return
-	}
-
-	baseDir := os.Getenv("SEARCH52_INDEX_DATA_DIR")
-	if baseDir == "" {
-		baseDir = "./data"
-	}
-	dataDir := filepath.Join(baseDir, req.IndexName)
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to create data dir: %w", err))
-		return
-	}
-	if err := sec.SaveAll(dataDir); err != nil {
-		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to save engine: %w", err))
-		return
-	}
-	resp := SaveEngineResponse{
-		Status:     "success",
-		StatusCode: http.StatusOK,
-		IndexName:  req.IndexName,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
-}
-
-func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("unsupported method"))
-		return
-	}
-
-	var req LoadEngineRequest
-	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-
-	baseDir := os.Getenv("SEARCH52_INDEX_DATA_DIR")
-	if baseDir == "" {
-		baseDir = "./data"
-	}
-
-	dataDir := filepath.Join(baseDir, req.IndexName)
-	start := time.Now()
-	eng, err := engine.LoadAll(dataDir)
-	if err != nil {
-		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to load index %q; existing in-memory index was left unchanged: %w", req.IndexName, err))
-		return
-	}
-
-	ht.mu.Lock()
-	ht.engines[req.IndexName] = eng
-	ht.mu.Unlock()
-
-	duration := time.Since(start)
-
-	resp := LoadEngineResponse{
-		Status:     "success",
-		StatusCode: http.StatusOK,
-		IndexName:  req.IndexName,
-		Duration:   duration.String(),
-		DurationMs: duration.Milliseconds(),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
-}
-
 // AddOrUpdateDocument upserts a single document into an existing index.
 // Endpoint suggestion: POST /document?indexName=...
 // Body: either { "document": {...} } or { "indexName": "...", "document": {...} }
@@ -831,131 +676,6 @@ func (ht *HTTP) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
-}
-
-func (ht *HTTP) CompactIndex(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
-		return
-	}
-
-	var req CompactIndexRequest
-	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-
-	ht.mu.RLock()
-	sec, ok := ht.engines[req.IndexName]
-	ht.mu.RUnlock()
-	if !ok {
-		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
-		return
-	}
-
-	start := time.Now()
-	stats := sec.CompactDeleted()
-	duration := time.Since(start)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(CompactIndexResponse{
-		Status:     "success",
-		StatusCode: http.StatusOK,
-		IndexName:  req.IndexName,
-		Stats:      stats,
-		Duration:   duration.String(),
-		DurationMs: duration.Milliseconds(),
-	})
-}
-
-// UpdatePrefix rebuilds the prefix lookup table for the named index from its
-// current active postings.
-func (ht *HTTP) UpdatePrefix(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
-		return
-	}
-
-	var req UpdatePrefixRequest
-	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-
-	ht.mu.RLock()
-	sec, ok := ht.engines[req.IndexName]
-	ht.mu.RUnlock()
-	if !ok {
-		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
-		return
-	}
-
-	start := time.Now()
-	sec.UpdatePrefix()
-	duration := time.Since(start)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(UpdatePrefixResponse{
-		Status:     "success",
-		StatusCode: http.StatusOK,
-		IndexName:  req.IndexName,
-		Duration:   duration.String(),
-		DurationMs: duration.Milliseconds(),
-	})
-}
-
-// UpdatePrefixAndFuzzy rebuilds the prefix lookup table and re-establishes the
-// frequency ordering of the fuzzy buckets for the named index.
-func (ht *HTTP) UpdatePrefixAndFuzzy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
-		return
-	}
-
-	var req UpdatePrefixAndFuzzyRequest
-	if err := decodeJSON(w, r, maxJSONBodyBytes, &req); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := validateIdentifier("indexName", req.IndexName, maxIndexNameLength); err != nil {
-		errJSON(w, http.StatusBadRequest, err)
-		return
-	}
-
-	ht.mu.RLock()
-	sec, ok := ht.engines[req.IndexName]
-	ht.mu.RUnlock()
-	if !ok {
-		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
-		return
-	}
-
-	start := time.Now()
-	sec.UpdatePrefixAndFuzzy()
-	duration := time.Since(start)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(UpdatePrefixAndFuzzyResponse{
-		Status:     "success",
-		StatusCode: http.StatusOK,
-		IndexName:  req.IndexName,
-		Duration:   duration.String(),
-		DurationMs: duration.Milliseconds(),
-	})
 }
 
 // Health is a simple health-check endpoint.

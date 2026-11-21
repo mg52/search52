@@ -73,11 +73,6 @@ func newAPIMux(ht *handler.HTTP) *http.ServeMux {
 	mux.HandleFunc("/search", ht.Search)
 	mux.HandleFunc("/add-to-index", requireAdminKey(ht.AddToIndex))
 	mux.HandleFunc("/list-indexes", ht.ListIndexes)
-	mux.HandleFunc("/save-controller", requireAdminKey(ht.SaveEngine))
-	mux.HandleFunc("/load-controller", requireAdminKey(ht.LoadEngine))
-	mux.HandleFunc("/compact-index", requireAdminKey(ht.CompactIndex))
-	mux.HandleFunc("/update-prefix", requireAdminKey(ht.UpdatePrefix))
-	mux.HandleFunc("/update-prefix-and-fuzzy", requireAdminKey(ht.UpdatePrefixAndFuzzy))
 	mux.HandleFunc("/health", ht.Health)
 	mux.HandleFunc("/document", requireAdminKey(documentHandler(ht)))
 	return mux
@@ -90,11 +85,6 @@ func newAdminMux(ht *handler.HTTP) *http.ServeMux {
 	mux.HandleFunc("/api/search", ht.Search)
 	mux.HandleFunc("/api/add-to-index", requireAdminKey(ht.AddToIndex))
 	mux.HandleFunc("/api/list-indexes", ht.ListIndexes)
-	mux.HandleFunc("/api/save-controller", requireAdminKey(ht.SaveEngine))
-	mux.HandleFunc("/api/load-controller", requireAdminKey(ht.LoadEngine))
-	mux.HandleFunc("/api/compact-index", requireAdminKey(ht.CompactIndex))
-	mux.HandleFunc("/api/update-prefix", requireAdminKey(ht.UpdatePrefix))
-	mux.HandleFunc("/api/update-prefix-and-fuzzy", requireAdminKey(ht.UpdatePrefixAndFuzzy))
 	mux.HandleFunc("/api/health", ht.Health)
 	mux.HandleFunc("/api/document", requireAdminKey(documentHandler(ht)))
 	return mux

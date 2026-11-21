@@ -52,10 +52,6 @@
       <button class="tab-button" data-tab="add" onclick="openTab('add')">Add/Update Document</button>
       <button class="tab-button" data-tab="delete" onclick="openTab('delete')">Delete Document</button>
       <button class="tab-button" data-tab="search" onclick="openTab('search')">Search</button>
-      <button class="tab-button" data-tab="save" onclick="openTab('save')">Save Index</button>
-      <button class="tab-button" data-tab="load" onclick="openTab('load')">Load Index</button>
-      <button class="tab-button" data-tab="compact" onclick="openTab('compact')">Compact Index</button>
-      <button class="tab-button" data-tab="updatePrefixAndFuzzy" onclick="openTab('updatePrefixAndFuzzy')">Update Prefix &amp; Fuzzy</button>
     </nav>
     <section id="tab-indexes" class="tab-panel active">
       <h2>Indexes</h2>
@@ -100,30 +96,6 @@
       <label>Filter</label>
       <input id="searchFilter" placeholder="year:2026,category:electronics">
       <p><button onclick="search()">Search</button></p>
-    </section>
-    <section id="tab-save" class="tab-panel">
-      <h2>Save Index</h2>
-      <label>Index name</label>
-      <input id="saveIndex" placeholder="products">
-      <p><button onclick="saveIndex()">Save</button></p>
-    </section>
-    <section id="tab-load" class="tab-panel">
-      <h2>Load Index</h2>
-      <label>Index name</label>
-      <input id="loadIndex" placeholder="products">
-      <p><button onclick="loadIndex()">Load</button></p>
-    </section>
-    <section id="tab-compact" class="tab-panel">
-      <h2>Compact Index</h2>
-      <label>Index name</label>
-      <input id="compactIndex" placeholder="products">
-      <p><button onclick="compactIndex()">Compact</button></p>
-    </section>
-    <section id="tab-updatePrefixAndFuzzy" class="tab-panel">
-      <h2>Update Prefix &amp; Fuzzy</h2>
-      <label>Index name</label>
-      <input id="updatePrefixAndFuzzyIndex" placeholder="products">
-      <p><button onclick="updatePrefixAndFuzzy()">Update Prefix &amp; Fuzzy</button></p>
     </section>
     <section>
       <h2>Response</h2>
@@ -229,36 +201,6 @@
       const filter = document.getElementById('searchFilter').value.trim();
       if (filter) params.set('filter', filter);
       await request('/api/search?' + params.toString(), { method: 'GET' });
-    }
-    async function saveIndex() {
-      await request('/api/save-controller', {
-        method: 'POST',
-        headers: adminHeaders({'Content-Type':'application/json'}),
-        body: JSON.stringify({ indexName: document.getElementById('saveIndex').value.trim() })
-      });
-    }
-    async function loadIndex() {
-      await request('/api/load-controller', {
-        method: 'POST',
-        headers: adminHeaders({'Content-Type':'application/json'}),
-        body: JSON.stringify({ indexName: document.getElementById('loadIndex').value.trim() })
-      });
-    }
-    async function compactIndex() {
-      await request('/api/compact-index', {
-        method: 'POST',
-        headers: adminHeaders({'Content-Type':'application/json'}),
-        body: JSON.stringify({ indexName: document.getElementById('compactIndex').value.trim() })
-      });
-      await refreshIndexes(false);
-    }
-    async function updatePrefixAndFuzzy() {
-      await request('/api/update-prefix-and-fuzzy', {
-        method: 'POST',
-        headers: adminHeaders({'Content-Type':'application/json'}),
-        body: JSON.stringify({ indexName: document.getElementById('updatePrefixAndFuzzyIndex').value.trim() })
-      });
-      await refreshIndexes(false);
     }
     refreshIndexes(false);
   </script>

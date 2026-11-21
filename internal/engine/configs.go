@@ -12,7 +12,6 @@ var (
 	// largest of those limits is unreachable and only costs memory. Raise this
 	// (SEARCH52_MAX_PREFIX_TERMS) if you raise those consumer limits past 64.
 	MaxPrefixTerms            = 64
-	SkipUpdatePrefix          = false
 	ExactMatchBoost           = 10
 	SingleTermMaxPrefixTokens = 3
 	SingleTermMaxFuzzyTokens  = 2
@@ -25,9 +24,6 @@ func init() {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			MaxPrefixTerms = n
 		}
-	}
-	if v := os.Getenv("SEARCH52_SKIP_UPDATE_PREFIX"); v != "" {
-		SkipUpdatePrefix = v == "true" || v == "1"
 	}
 	if v := os.Getenv("SEARCH52_EXACT_MATCH_BOOST"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
