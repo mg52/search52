@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
@@ -209,95 +207,6 @@ func resultHasDocWithIDPrefix(res *SearchResult, prefix byte) bool {
 		}
 	}
 	return false
-}
-
-// addFuzzyRankingDocs upserts four rare ED1 neighbours of "irom" followed by
-// five copies of the common correction "iron", all via incremental upserts so
-// the SymSpell buckets start in insertion (non-frequency) order. Returns the
-// engine for a finalize step (Compact/Save+Load) to re-sort.
-func addFuzzyRankingDocs(t *testing.T, se *SearchEngine) {
-	t.Helper()
-	for _, w := range []string{"irok", "irop", "iroq", "iros"} {
-		if err := se.AddOrUpdateDocument(map[string]interface{}{"id": w, "title": w}); err != nil {
-			t.Fatalf("AddOrUpdateDocument(%q): %v", w, err)
-		}
-	}
-	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("n%d", i)
-		if err := se.AddOrUpdateDocument(map[string]interface{}{"id": id, "title": "iron"}); err != nil {
-			t.Fatalf("AddOrUpdateDocument(%q): %v", id, err)
-		}
-	}
-}
-
-// TestCompactDeletedSortsFuzzyByFrequency verifies CompactDeleted re-establishes
-// frequency order in the SymSpell buckets: with the fuzzy cap pinned to 1, the
-// misspelled "irom" only resolves to "iron" if "iron" is ranked first.
-func TestCompactDeletedSortsFuzzyByFrequency(t *testing.T) {
-	defer func(v int) { SingleTermMaxFuzzyTokens = v }(SingleTermMaxFuzzyTokens)
-	SingleTermMaxFuzzyTokens = 1
-
-	se := NewSearchEngine([]string{"title"}, nil, nil, 100)
-	addFuzzyRankingDocs(t, se)
-
-	se.CompactDeleted()
-
-	res, err := se.Search(context.Background(), "irom", nil)
-	if err != nil {
-		t.Fatalf("Search: %v", err)
-	}
-	if !resultHasDocWithIDPrefix(res, 'n') {
-		t.Fatalf("expected 'iron' docs (n*) after CompactDeleted, got %+v", res.Docs)
-	}
-}
-
-// TestUpdatePrefixAndFuzzySortsFuzzyByFrequency verifies the maintenance entry
-// point re-establishes frequency order for an incrementally-built engine: with
-// the fuzzy cap pinned to 1, "irom" only resolves to "iron" if the bucket was
-// re-sorted by frequency.
-func TestUpdatePrefixAndFuzzySortsFuzzyByFrequency(t *testing.T) {
-	defer func(v int) { SingleTermMaxFuzzyTokens = v }(SingleTermMaxFuzzyTokens)
-	SingleTermMaxFuzzyTokens = 1
-
-	se := NewSearchEngine([]string{"title"}, nil, nil, 100)
-	addFuzzyRankingDocs(t, se)
-
-	se.UpdatePrefixAndFuzzy()
-
-	res, err := se.Search(context.Background(), "irom", nil)
-	if err != nil {
-		t.Fatalf("Search: %v", err)
-	}
-	if !resultHasDocWithIDPrefix(res, 'n') {
-		t.Fatalf("expected 'iron' docs (n*) after UpdatePrefixAndFuzzy, got %+v", res.Docs)
-	}
-}
-
-// TestLoadAllSortsFuzzyByFrequency verifies the same for the Save+Load finalize
-// path: a freshly loaded engine must rank fuzzy corrections by frequency.
-func TestLoadAllSortsFuzzyByFrequency(t *testing.T) {
-	defer func(v int) { SingleTermMaxFuzzyTokens = v }(SingleTermMaxFuzzyTokens)
-	SingleTermMaxFuzzyTokens = 1
-
-	se := NewSearchEngine([]string{"title"}, nil, nil, 100)
-	addFuzzyRankingDocs(t, se)
-
-	dir := t.TempDir()
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-	loaded, err := LoadAll(dir)
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-
-	res, err := loaded.Search(context.Background(), "irom", nil)
-	if err != nil {
-		t.Fatalf("Search: %v", err)
-	}
-	if !resultHasDocWithIDPrefix(res, 'n') {
-		t.Fatalf("expected 'iron' docs (n*) after LoadAll, got %+v", res.Docs)
-	}
 }
 
 func TestSearchMultiTermAND_OR(t *testing.T) {
@@ -554,140 +463,6 @@ func containsString(arr []string, s string) bool {
 		}
 	}
 	return false
-}
-
-func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
-	// 1) Build engine + mutate state (add/update/delete)
-	se := NewSearchEngine(
-		[]string{"name"},
-		nil,
-		map[string]bool{"year": true},
-		10,
-	)
-
-	// Add docs
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":   "1",
-		"name": "Sunny Rio",
-		"year": "2020",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument doc1: %v", err)
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":   "2",
-		"name": "Rio Nights",
-		"year": "2021",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument doc2: %v", err)
-	}
-
-	// Update doc2: remove "rio", add "sunny"
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":   "2",
-		"name": "Sunny Days",
-		"year": "2021",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument doc2 update: %v", err)
-	}
-
-	// Delete doc1
-	if ok := se.DeleteDocument("1"); !ok {
-		t.Fatalf("DeleteDocument(1) expected true")
-	}
-
-	// Sanity before save
-	assertIDs(t, mustSingleTermSearchLoop(t, se, "sunny", nil), "2")
-	assertIDs(t, mustSingleTermSearchLoop(t, se, "rio", nil)) // should be empty now
-
-	// 2) Save to temp dir
-	dir := t.TempDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir temp dir: %v", err)
-	}
-
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "engine.gob")); err != nil {
-		t.Fatalf("expected engine.gob to exist: %v", err)
-	}
-
-	// 3) Load and ensure derived structures are rebuilt from Documents
-	loaded, err := LoadAll(dir)
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-
-	// Metadata restored
-	if loaded.ResultSize != 10 {
-		t.Fatalf("ResultSize mismatch: got=%d exp=%d", loaded.ResultSize, 10)
-	}
-	if len(loaded.IndexFields) != 1 || loaded.IndexFields[0] != "name" {
-		t.Fatalf("IndexFields mismatch: got=%v", loaded.IndexFields)
-	}
-	if !loaded.Filters["year"] {
-		t.Fatalf("Filters mismatch: expected Filters[year]=true")
-	}
-
-	// Searches work (meaning DataMap rebuilt and tombstones respected)
-	assertIDs(t, mustSingleTermSearchLoop(t, loaded, "sunny", nil), "2")
-	assertIDs(t, mustSingleTermSearchLoop(t, loaded, "rio", nil)) // empty
-
-	// Filter logic rebuilt
-	filtered := mustSingleTermSearchLoop(t, loaded, "sunny", map[string][]interface{}{"year": {"2021"}})
-	assertIDs(t, filtered, "2")
-	filtered = mustSingleTermSearchLoop(t, loaded, "sunny", map[string][]interface{}{"year": {"2020"}})
-	assertIDs(t, filtered) // empty
-
-	// Derived structures sanity checks (not exhaustive, but ensures rebuild happened)
-	if loaded.DataMap["sunny"] == nil {
-		t.Fatalf("expected DataMap to contain 'sunny' after rebuild")
-	}
-	yearBits := loaded.FilterBits["year:2021"]
-	hasAny := false
-	for _, w := range yearBits {
-		if w != 0 {
-			hasAny = true
-			break
-		}
-	}
-	if !hasAny {
-		t.Fatalf("expected FilterBits['year:2021'] to have bits set after rebuild")
-	}
-
-	// Prefix map should have 'sunny' under prefix 'su' after rebuild
-	if len(loaded.Prefix["su"]) == 0 {
-		t.Fatalf("expected Prefix map to have terms under 'su' after rebuild")
-	}
-
-	// DataMap + Symspell should have the indexed term
-	if _, ok := loaded.DataMap["sunny"]; !ok {
-		t.Fatalf("expected DataMap to contain 'sunny' after rebuild")
-	}
-	if loaded.Symspell == nil {
-		t.Fatalf("expected Symspell to be non-nil after rebuild")
-	}
-	// SymSpell often returns empty for an exact word; test a near-miss instead.
-	fz := loaded.Symspell.FuzzySearch("suny", 10) // missing one 'n'
-	if len(fz) == 0 {
-		t.Fatalf("expected Symspell.FuzzySearch('suny') to return suggestions after rebuild, got=%v", fz)
-	}
-	// Optional: if your implementation usually suggests the correct word:
-	if !containsString(fz, "sunny") {
-		t.Logf("note: Symspell suggestions for 'suny' did not include 'sunny': %v", fz)
-	}
-
-	// 4) Verify nextInternalID is usable after load by inserting a new doc
-	if err := loaded.AddOrUpdateDocument(map[string]interface{}{
-		"id":   "3",
-		"name": "Rio Sunny",
-		"year": "2022",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument doc3 after load: %v", err)
-	}
-
-	assertIDs(t, mustSingleTermSearchLoop(t, loaded, "rio", nil), "3")
-	assertIDs(t, mustSingleTermSearchLoop(t, loaded, "sunny", nil), "2", "3")
 }
 
 func TestMultiTermSearch_E2E(t *testing.T) {
@@ -1164,7 +939,7 @@ func TestWeightedFields_SearchUpdateDelete_E2E(t *testing.T) {
 	assertIDs(t, res.Docs, "filtered-title-hit")
 }
 
-func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
+func TestWeightedFields_MultiTerm_E2E(t *testing.T) {
 	se := NewSearchEngine(
 		[]string{"title", "artist", "album"},
 		map[string]int{"title": 6, "artist": 3, "album": 1},
@@ -1216,7 +991,7 @@ func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
 	expectedOrder := []string{"title-match", "artist-match", "album-match"}
 	for i, expectedID := range expectedOrder {
 		if res.Docs[i].ID != expectedID {
-			t.Fatalf("unexpected weighted order before load: got %+v expected=%v", res.Docs, expectedOrder)
+			t.Fatalf("unexpected weighted order: got %+v expected=%v", res.Docs, expectedOrder)
 		}
 	}
 
@@ -1229,41 +1004,9 @@ func TestWeightedFields_SaveLoadAndMultiTerm_E2E(t *testing.T) {
 	}
 	for i, expectedID := range expectedOrder {
 		if multi.Docs[i].ID != expectedID {
-			t.Fatalf("unexpected weighted multi-term order before load: got %+v expected=%v", multi.Docs, expectedOrder)
+			t.Fatalf("unexpected weighted multi-term order: got %+v expected=%v", multi.Docs, expectedOrder)
 		}
 	}
-
-	dir := t.TempDir()
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-
-	loaded, err := LoadAll(dir)
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-	if loaded.FieldWeights["title"] != 6 || loaded.FieldWeights["artist"] != 3 || loaded.FieldWeights["album"] != 1 {
-		t.Fatalf("field weights were not restored: %+v", loaded.FieldWeights)
-	}
-
-	res, _ = loaded.Search(context.Background(), "iron", map[string][]interface{}{"kind": {"track"}})
-	if res == nil {
-		t.Fatalf("loaded Search returned nil")
-	}
-	if len(res.Docs) != 3 {
-		t.Fatalf("expected 3 loaded track docs for iron, got %d: %+v", len(res.Docs), res.Docs)
-	}
-	for i, expectedID := range expectedOrder {
-		if res.Docs[i].ID != expectedID {
-			t.Fatalf("unexpected weighted order after load: got %+v expected=%v", res.Docs, expectedOrder)
-		}
-	}
-
-	filtered, _ := loaded.Search(context.Background(), "iron", map[string][]interface{}{"kind": {"podcast"}})
-	if filtered == nil {
-		t.Fatalf("loaded filtered Search returned nil")
-	}
-	assertIDs(t, filtered.Docs, "filtered-match")
 }
 
 func TestIndex_MultipleBatches(t *testing.T) {
@@ -1346,341 +1089,6 @@ func TestIndex_MultipleBatches(t *testing.T) {
 			t.Fatalf("expected doc %s for query %q, got %+v",
 				tt.expectedID, tt.query, res.Docs)
 		}
-	}
-}
-
-// TestSaveLoad_SingleAndMultiTermSearchAfterLoad verifies that SingleTermSearch
-// and MultiTermSearch (which use termSet) work correctly after a save/load cycle.
-func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
-	se := NewSearchEngine(
-		[]string{"title"},
-		nil,
-		map[string]bool{"year": true},
-		10,
-	)
-
-	docs := []map[string]interface{}{
-		{"id": "1", "title": "golden gate bridge", "year": "2020"},
-		{"id": "2", "title": "golden sunrise vista", "year": "2021"},
-		{"id": "3", "title": "bridge repairs ongoing", "year": "2020"},
-	}
-	se.Index(docs)
-
-	dir := t.TempDir()
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-
-	loaded, err := LoadAll(dir)
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-
-	// SearchContext: exact single-term match via termSet
-	res, err := loaded.Search(context.Background(), "golden", nil)
-	if err != nil {
-		t.Fatalf("SearchContext('golden'): %v", err)
-	}
-	if len(res.Docs) == 0 {
-		t.Fatal("SearchContext('golden') returned no results after load")
-	}
-	ids := make(map[string]bool)
-	for _, d := range res.Docs {
-		ids[d.ID] = true
-	}
-	if !ids["1"] || !ids["2"] {
-		t.Errorf("SearchContext('golden') expected ids 1 and 2, got %v", ids)
-	}
-
-	// SearchContext: prefix match (term not exact, relies on Prefix rebuild)
-	resPrefix, err := loaded.Search(context.Background(), "brid", nil)
-	if err != nil {
-		t.Fatalf("SearchContext('brid'): %v", err)
-	}
-	if len(resPrefix.Docs) == 0 {
-		t.Fatal("SearchContext prefix 'brid' returned no results after load")
-	}
-
-	// SearchContext: single-term with filter
-	resFiltered, err := loaded.Search(context.Background(), "golden", map[string][]interface{}{"year": {"2021"}})
-	if err != nil {
-		t.Fatalf("SearchContext('golden', filter): %v", err)
-	}
-	if len(resFiltered.Docs) != 1 || resFiltered.Docs[0].ID != "2" {
-		t.Errorf("SearchContext('golden', year=2021) expected only doc 2, got %v", resFiltered.Docs)
-	}
-
-	// SearchContext: both terms must appear
-	resMulti, err := loaded.Search(context.Background(), "golden bridge", nil)
-	if err != nil {
-		t.Fatalf("SearchContext('golden bridge'): %v", err)
-	}
-	if len(resMulti.Docs) == 0 {
-		t.Fatal("SearchContext('golden bridge') returned no results after load")
-	}
-	if resMulti.Docs[0].ID != "1" {
-		t.Errorf("SearchContext('golden bridge') expected doc 1 first, got %v", resMulti.Docs[0].ID)
-	}
-
-	// SearchContext: multi-term with filter
-	resMultiFiltered, err := loaded.Search(context.Background(), "golden bridge", map[string][]interface{}{"year": {"2020"}})
-	if err != nil {
-		t.Fatalf("SearchContext('golden bridge', filter): %v", err)
-	}
-	if len(resMultiFiltered.Docs) != 1 || resMultiFiltered.Docs[0].ID != "1" {
-		t.Errorf("SearchContext('golden bridge', year=2020) expected only doc 1, got %v", resMultiFiltered.Docs)
-	}
-}
-
-// TestSaveLoad_BulkIndexPath verifies save/load correctness when indexing is
-// done via the bulk Index() path (InsertDocs + BuildDocumentIndex).
-func TestSaveLoad_BulkIndexPath(t *testing.T) {
-	se := NewSearchEngine(
-		[]string{"name", "tags"},
-		nil,
-		map[string]bool{"category": true},
-		10,
-	)
-
-	docs := []map[string]interface{}{
-		{"id": "a", "name": "swift runner", "tags": "sports outdoor", "category": "fitness"},
-		{"id": "b", "name": "calm waters", "tags": "nature peaceful", "category": "travel"},
-		{"id": "c", "name": "swift breeze", "tags": "outdoor weather", "category": "travel"},
-	}
-	se.Index(docs)
-
-	// Verify pre-save state
-	pre := mustSingleTermSearchLoop(t, se, "swift", nil)
-	if len(pre) != 2 {
-		t.Fatalf("expected 2 docs for 'swift' before save, got %d", len(pre))
-	}
-
-	dir := t.TempDir()
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-
-	loaded, err := LoadAll(dir)
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-
-	// Exact search restored
-	post := mustSingleTermSearchLoop(t, loaded, "swift", nil)
-	if len(post) != 2 {
-		t.Fatalf("expected 2 docs for 'swift' after load, got %d", len(post))
-	}
-
-	// Filter bitset restored
-	filtered := mustSingleTermSearchLoop(t, loaded, "swift", map[string][]interface{}{"category": {"fitness"}})
-	if len(filtered) != 1 || filtered[0].ID != "a" {
-		t.Errorf("expected only doc 'a' for swift+fitness filter after load, got %v", filtered)
-	}
-
-	// OR filter within same field
-	orFiltered := mustSingleTermSearchLoop(t, loaded, "swift", map[string][]interface{}{"category": {"fitness", "travel"}})
-	if len(orFiltered) != 2 {
-		t.Errorf("expected 2 docs for swift with fitness|travel filter after load, got %d", len(orFiltered))
-	}
-
-	// termSet populated: SearchContext single-term path works
-	singleRes, err := loaded.Search(context.Background(), "calm", nil)
-	if err != nil {
-		t.Fatalf("SearchContext('calm'): %v", err)
-	}
-	if len(singleRes.Docs) == 0 || singleRes.Docs[0].ID != "b" {
-		t.Errorf("SearchContext('calm') after load expected doc b, got %v", singleRes.Docs)
-	}
-
-	// Mutate after load: add a new doc, verify it is searchable
-	if err := loaded.AddOrUpdateDocument(map[string]interface{}{
-		"id": "d", "name": "swift mountain", "tags": "outdoor hiking", "category": "fitness",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument after load: %v", err)
-	}
-	postMutate := mustSingleTermSearchLoop(t, loaded, "swift", nil)
-	if len(postMutate) != 3 {
-		t.Fatalf("expected 3 docs for 'swift' after adding doc d, got %d", len(postMutate))
-	}
-}
-
-func TestCompactDeleted_RebuildsCurrentIndexOnly(t *testing.T) {
-	se := NewSearchEngine(
-		[]string{"title", "artist"},
-		map[string]int{"title": 3, "artist": 1},
-		map[string]bool{"year": true},
-		10,
-	)
-
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id": "1", "title": "old iron", "artist": "archive", "year": "1980",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument old: %v", err)
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id": "1", "title": "current iron", "artist": "maiden", "year": "1981",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument current: %v", err)
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id": "2", "title": "deleted iron", "artist": "gone", "year": "1982",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument deleted: %v", err)
-	}
-	if ok := se.DeleteDocument("2"); !ok {
-		t.Fatal("DeleteDocument(2) expected true")
-	}
-
-	before := se.Stats()
-	if before.StoredDocuments != 1 || before.ActiveDocuments != 1 {
-		t.Fatalf("unexpected pre-compact stats: %+v", before)
-	}
-
-	stats := se.CompactDeleted()
-	if stats.BeforeStored != 1 || stats.BeforeActive != 1 || stats.AfterStored != 1 || stats.AfterActive != 1 || stats.RemovedVersions != 0 {
-		t.Fatalf("unexpected compact stats: %+v", stats)
-	}
-
-	after := se.Stats()
-	if after.StoredDocuments != 1 || after.ActiveDocuments != 1 {
-		t.Fatalf("unexpected post-compact stats: %+v", after)
-	}
-	if got := mustSingleTermSearchLoop(t, se, "current", nil); len(got) != 1 || got[0].ID != "1" {
-		t.Fatalf("expected current doc after compact, got %v", got)
-	}
-	if got := mustSingleTermSearchLoop(t, se, "old", nil); len(got) != 0 {
-		t.Fatalf("expected old postings removed, got %v", got)
-	}
-	if got := mustSingleTermSearchLoop(t, se, "deleted", nil); len(got) != 0 {
-		t.Fatalf("expected deleted postings removed, got %v", got)
-	}
-	if got := mustSingleTermSearchLoop(t, se, "current", map[string][]interface{}{"year": {"1981"}}); len(got) != 1 || got[0].ID != "1" {
-		t.Fatalf("expected rebuilt filter bits after compact, got %v", got)
-	}
-}
-
-func TestUpdatePrefixOrdersByActiveDocFrequencyAndDropsDeletedTerms(t *testing.T) {
-	if SkipUpdatePrefix {
-		t.Skip("UpdatePrefix ordering is disabled by SkipUpdatePrefix")
-	}
-
-	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
-
-	docs := []map[string]interface{}{
-		{"id": "1", "title": "pearl"},
-		{"id": "2", "title": "pearl"},
-		{"id": "3", "title": "pearl"},
-		{"id": "4", "title": "peach"},
-		{"id": "5", "title": "peach"},
-		{"id": "6", "title": "peanut"},
-		{"id": "7", "title": "pebble"},
-		{"id": "8", "title": "pesto"},
-	}
-	for _, doc := range docs {
-		if err := se.AddOrUpdateDocument(doc); err != nil {
-			t.Fatalf("AddOrUpdateDocument: %v", err)
-		}
-	}
-	if ok := se.DeleteDocument("7"); !ok {
-		t.Fatal("DeleteDocument(7) expected true")
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "8", "title": "kiwi"}); err != nil {
-		t.Fatalf("AddOrUpdateDocument update: %v", err)
-	}
-
-	se.UpdatePrefix()
-
-	se.mu.RLock()
-	got := append([]string(nil), se.Prefix["pe"]...)
-	se.mu.RUnlock()
-
-	wantPrefix := []string{"pearl", "peach", "peanut"}
-	if len(got) < len(wantPrefix) {
-		t.Fatalf("Prefix[pe] too short: got=%v want prefix=%v", got, wantPrefix)
-	}
-	for i, want := range wantPrefix {
-		if got[i] != want {
-			t.Fatalf("Prefix[pe] order mismatch: got=%v want prefix=%v", got, wantPrefix)
-		}
-	}
-	for _, term := range got {
-		if term == "pebble" || term == "pesto" {
-			t.Fatalf("Prefix[pe] contains inactive term %q: %v", term, got)
-		}
-	}
-}
-
-func TestUpdatePrefixOrdersByActiveDocFrequencyAndDropsDeletedTerms2(t *testing.T) {
-	if SkipUpdatePrefix {
-		t.Skip("UpdatePrefix ordering is disabled by SkipUpdatePrefix")
-	}
-
-	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
-
-	docs := []map[string]interface{}{
-		{"id": "1", "title": "pearl"},
-		{"id": "2", "title": "pearl"},
-		{"id": "3", "title": "pearl"},
-		{"id": "4", "title": "peach"},
-		{"id": "5", "title": "peach"},
-		{"id": "6", "title": "peanut"},
-		{"id": "7", "title": "pebble"},
-		{"id": "8", "title": "pesto"},
-	}
-	for _, doc := range docs {
-		if err := se.AddOrUpdateDocument(doc); err != nil {
-			t.Fatalf("AddOrUpdateDocument: %v", err)
-		}
-	}
-
-	se.UpdatePrefix()
-
-	se.mu.RLock()
-	got := append([]string(nil), se.Prefix["pea"]...)
-	se.mu.RUnlock()
-
-	wantPrefix := []string{"pearl", "peach", "peanut"}
-	if len(got) < len(wantPrefix) {
-		t.Fatalf("Prefix[pe] too short: got=%v want prefix=%v", got, wantPrefix)
-	}
-	for i, want := range wantPrefix {
-		if got[i] != want {
-			t.Fatalf("Prefix[pe] order mismatch: got=%v want prefix=%v", got, wantPrefix)
-		}
-	}
-	for _, term := range got {
-		if term == "pebble" || term == "pesto" {
-			t.Fatalf("Prefix[pe] contains inactive term %q: %v", term, got)
-		}
-	}
-
-	if ok := se.DeleteDocument("1"); !ok {
-		t.Fatal("DeleteDocument(1) expected true")
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "2", "title": "kiwi"}); err != nil {
-		t.Fatalf("AddOrUpdateDocument update: %v", err)
-	}
-
-	se.UpdatePrefix()
-
-	se.mu.RLock()
-	got = append([]string(nil), se.Prefix["pea"]...)
-	se.mu.RUnlock()
-
-	if len(got) < 3 {
-		t.Fatalf("Prefix[pe] too short: got=%v want prefix=3", got)
-	}
-
-	if got[0] != "peach" {
-		t.Fatalf("Prefix[pe] contains wrong term, got: %s, want: peach", got[0])
-	}
-
-	if !(got[1] == "pearl" || got[1] == "peanut") {
-		t.Fatalf("Prefix[pe] contains wrong term, got: %s, want: pearl or peanut", got[1])
-	}
-
-	if !(got[2] == "pearl" || got[2] == "peanut") {
-		t.Fatalf("Prefix[pe] contains wrong term, got: %s, want: pearl or peanut", got[2])
 	}
 }
 
@@ -1803,51 +1211,6 @@ func TestNumericYearFilterValuesAreIndexed(t *testing.T) {
 	}
 }
 
-func TestSaveLoadRebuildsArrayAndNumericFilters(t *testing.T) {
-	se := NewSearchEngine(
-		[]string{"name", "category", "description"},
-		nil,
-		map[string]bool{"category": true, "year": true},
-		10,
-	)
-
-	se.Index([]map[string]interface{}{
-		{
-			"id":          "p24",
-			"name":        "greenbackism hyrax ars venturers speiring dogsbodyings wems ringbarks",
-			"category":    []interface{}{"music", "yard", "party", "collectibles", "tea"},
-			"description": "papa caricature airlines peremptoriness storages",
-			"year":        2024,
-		},
-		{
-			"id":          "p25",
-			"name":        "ringbarks alternate",
-			"category":    []interface{}{"coffee"},
-			"description": "another product",
-			"year":        float64(2025),
-		},
-	})
-
-	dir := t.TempDir()
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-	loaded, err := LoadAll(dir)
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-
-	res, _ := loaded.Search(context.Background(), "ringbarks", map[string][]interface{}{"category": {"tea"}, "year": {"2024"}})
-	if len(res.Docs) != 1 || res.Docs[0].ID != "p24" {
-		t.Fatalf("expected p24 after load for category:tea year:2024, got %+v", res.Docs)
-	}
-
-	res, _ = loaded.Search(context.Background(), "ringbarks", map[string][]interface{}{"category": {"coffee"}, "year": {"2025"}})
-	if len(res.Docs) != 1 || res.Docs[0].ID != "p25" {
-		t.Fatalf("expected p25 after load for category:coffee year:2025, got %+v", res.Docs)
-	}
-}
-
 func TestIndexBatchingMatchesSingleBatch(t *testing.T) {
 	docs := make([]map[string]interface{}, 100)
 	for i := range docs {
@@ -1879,28 +1242,6 @@ func TestIndexBatchingMatchesSingleBatch(t *testing.T) {
 	batched.Index(docs[66:])
 
 	assertEnginesEquivalent(t, oneShot, batched)
-}
-
-func TestSaveAll_NoTempFileRemains(t *testing.T) {
-	se := NewSearchEngine([]string{"name"}, nil, nil, 10)
-	if err := se.AddOrUpdateDocument(map[string]interface{}{"id": "1", "name": "hello world"}); err != nil {
-		t.Fatalf("AddOrUpdateDocument: %v", err)
-	}
-
-	dir := t.TempDir()
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-
-	gobPath := filepath.Join(dir, "engine.gob")
-	if _, err := os.Stat(gobPath); err != nil {
-		t.Fatalf("engine.gob not found after SaveAll: %v", err)
-	}
-
-	tmpPath := gobPath + ".tmp"
-	if _, err := os.Stat(tmpPath); err == nil {
-		t.Fatal("engine.gob.tmp must not remain after a successful SaveAll")
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2035,9 +1376,9 @@ func TestTermSet_MultipleDocsSameTermBothPresent(t *testing.T) {
 	}
 }
 
-// TestTermSet_DeletedDocTermsRemainUntilCompact verifies that deleting a doc
-// does NOT remove its terms from the termSet — they persist until CompactDeleted.
-func TestTermSet_DeletedDocTermsRemainUntilCompact(t *testing.T) {
+// TestTermSet_DeletedDocTermsRemain verifies that deleting a doc
+// does NOT remove its terms from the termSet — they persist.
+func TestTermSet_DeletedDocTermsRemain(t *testing.T) {
 	se := newTermSetEngine()
 	if err := se.AddOrUpdateDocument(map[string]interface{}{
 		"id":    "1",
@@ -2050,7 +1391,7 @@ func TestTermSet_DeletedDocTermsRemainUntilCompact(t *testing.T) {
 
 	// Terms must still be in termSet (DataMap still has them).
 	if !inTermSet(se, "phantom") || !inTermSet(se, "signal") {
-		t.Error("terms of a deleted doc must remain in termSet until CompactDeleted")
+		t.Error("terms of a deleted doc must remain in termSet")
 	}
 }
 
@@ -2076,94 +1417,9 @@ func TestTermSet_UpdateAddsNewTerms(t *testing.T) {
 	if !inTermSet(se, "golden") || !inTermSet(se, "storm") {
 		t.Error("new terms from update must be in termSet")
 	}
-	// Old terms also remain (DataMap still holds them until compact)
+	// Old terms also remain (DataMap still holds them)
 	if !inTermSet(se, "crimson") || !inTermSet(se, "wave") {
-		t.Error("old terms must remain in termSet until CompactDeleted")
-	}
-}
-
-// TestTermSet_CompactPrunesOrphanedTerms verifies that after CompactDeleted,
-// terms that belonged exclusively to deleted/old document versions are gone.
-func TestTermSet_CompactPrunesOrphanedTerms(t *testing.T) {
-	se := newTermSetEngine()
-	// Doc 1: add then delete — all its terms become orphaned
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":    "1",
-		"title": "Vanishing Comet",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	se.DeleteDocument("1")
-
-	// Doc 2: add, then update — old terms "initial draft" become orphaned
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":    "2",
-		"title": "Initial Draft",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":    "2",
-		"title": "Final Version",
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Doc 3: stays active
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":    "3",
-		"title": "Survivor Track",
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	se.CompactDeleted()
-
-	// Orphaned terms (only used by deleted/old versions) must be gone
-	for _, orphan := range []string{"vanishing", "comet", "initial", "draft"} {
-		if inTermSet(se, orphan) {
-			t.Errorf("orphaned term %q must be removed from termSet after compact", orphan)
-		}
-	}
-	// Active terms must survive
-	for _, active := range []string{"final", "version", "survivor", "track"} {
-		if !inTermSet(se, active) {
-			t.Errorf("active term %q must remain in termSet after compact", active)
-		}
-	}
-}
-
-// TestTermSet_SharedTermSurvivesCompact verifies that a term appearing in both
-// an active doc and a deleted doc is NOT removed after compact.
-func TestTermSet_SharedTermSurvivesCompact(t *testing.T) {
-	se := newTermSetEngine()
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":    "1",
-		"title": "Shared Echo Gone",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":    "2",
-		"title": "Shared Echo Lives",
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	se.DeleteDocument("1")
-	se.CompactDeleted()
-
-	// "shared" and "echo" are in both docs — must survive because doc 2 is active
-	if !inTermSet(se, "shared") || !inTermSet(se, "echo") {
-		t.Error("term shared by active and deleted doc must survive compact")
-	}
-	// "gone" belongs only to doc 1 (deleted) — must be pruned
-	if inTermSet(se, "gone") {
-		t.Error("term exclusive to deleted doc must be pruned after compact")
-	}
-	// "lives" belongs to doc 2 (active) — must survive
-	if !inTermSet(se, "lives") {
-		t.Error("term from active doc must survive compact")
+		t.Error("old terms must remain in termSet")
 	}
 }
 
@@ -2278,5 +1534,130 @@ func assertEnginesEquivalent(t *testing.T, want, got *SearchEngine) {
 	}
 	if want.nextInternalID != got.nextInternalID {
 		t.Fatalf("nextInternalID mismatch: got %d want %d", got.nextInternalID, want.nextInternalID)
+	}
+}
+
+func TestStatsAndStoredDocumentCount_AfterUpdateAndDelete(t *testing.T) {
+	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"year": true}, 10)
+	add := func(id, title string) {
+		t.Helper()
+		if err := se.AddOrUpdateDocument(map[string]interface{}{"id": id, "title": title}); err != nil {
+			t.Fatalf("AddOrUpdateDocument(%q): %v", id, err)
+		}
+	}
+
+	add("a", "apple")
+	add("b", "banana")
+	add("a", "apricot") // update: old version of "a" becomes a tombstone
+	if !se.DeleteDocument("b") {
+		t.Fatal("DeleteDocument(b) = false")
+	}
+	if se.DeleteDocument("b") {
+		t.Fatal("deleting b twice must return false")
+	}
+
+	st := se.Stats()
+	if st.ActiveDocuments != 1 || st.StoredDocuments != 1 || st.TombstonedVersions != 2 {
+		t.Fatalf("unexpected stats: %+v", st)
+	}
+	if !reflect.DeepEqual(st.IndexFields, []string{"title"}) || !st.Filters["year"] || st.ResultSize != 10 {
+		t.Fatalf("unexpected config in stats: %+v", st)
+	}
+	if got := se.StoredDocumentCount(); got != 1 {
+		t.Fatalf("StoredDocumentCount = %d, want 1", got)
+	}
+
+	// Stats must hand out copies: mutating them must not change the engine.
+	st.IndexFields[0] = "changed"
+	st.Filters["other"] = true
+	if again := se.Stats(); again.IndexFields[0] != "title" || again.Filters["other"] {
+		t.Fatalf("Stats leaked internal state: %+v", again)
+	}
+}
+
+// Bulk Index finalizes by sorting SymSpell buckets by term frequency. With the
+// fuzzy cap pinned to 1, the misspelled "irom" only resolves to the common
+// "iron" if that sort ran.
+func TestIndex_SortsFuzzyByFrequency(t *testing.T) {
+	old := SingleTermMaxFuzzyTokens
+	SingleTermMaxFuzzyTokens = 1
+	t.Cleanup(func() { SingleTermMaxFuzzyTokens = old })
+
+	se := NewSearchEngine([]string{"title"}, nil, nil, 20)
+	var docs []map[string]interface{}
+	for _, w := range []string{"irok", "irop", "iroq", "iros"} {
+		docs = append(docs, map[string]interface{}{"id": w, "title": w})
+	}
+	for _, id := range []string{"n0", "n1", "n2", "n3", "n4"} {
+		docs = append(docs, map[string]interface{}{"id": id, "title": "iron"})
+	}
+	se.Index(docs)
+
+	res, err := se.Search(context.Background(), "irom", nil)
+	if err != nil || res == nil {
+		t.Fatalf("Search: res=%v err=%v", res, err)
+	}
+	if len(res.Docs) != 5 {
+		t.Fatalf("expected the 5 'iron' docs, got %+v", res.Docs)
+	}
+	for _, d := range res.Docs {
+		if d.ID[0] != 'n' {
+			t.Fatalf("expected only 'iron' docs, got %+v", res.Docs)
+		}
+	}
+}
+
+// Popularity was removed: a "popularity" field is just another document field
+// and must not change the score.
+func TestPopularityFieldDoesNotAffectScore(t *testing.T) {
+	se := NewSearchEngine([]string{"title"}, nil, nil, 10)
+	for _, doc := range []map[string]interface{}{
+		{"id": "popular", "title": "apple", "popularity": 1000000},
+		{"id": "plain", "title": "apple"},
+	} {
+		if err := se.AddOrUpdateDocument(doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res, err := se.Search(context.Background(), "apple", nil)
+	if err != nil || res == nil || len(res.Docs) != 2 {
+		t.Fatalf("Search: res=%v err=%v", res, err)
+	}
+	if res.Docs[0].Score != res.Docs[1].Score {
+		t.Fatalf("popularity must not change scores, got %+v", res.Docs)
+	}
+	for _, d := range res.Docs {
+		if d.ID == "popular" {
+			if _, ok := d.Data["popularity"]; !ok {
+				t.Fatalf("popularity should stay a plain stored field, got %+v", d.Data)
+			}
+		}
+	}
+}
+
+func TestFilterKeys(t *testing.T) {
+	tests := []struct {
+		name  string
+		value interface{}
+		want  []string
+	}{
+		{"string", "2020", []string{"year:2020"}},
+		{"empty string", "", nil},
+		{"int", 2020, []string{"year:2020"}},
+		{"float64", float64(2020), []string{"year:2020"}},
+		{"string slice skips empties", []string{"a", "", "b"}, []string{"year:a", "year:b"}},
+		{"interface slice", []interface{}{"a", float64(2), nil, true}, []string{"year:a", "year:2"}},
+		{"unsupported type", true, nil},
+		{"nil", nil, nil},
+	}
+	for _, tt := range tests {
+		got := filterKeys("year", tt.value)
+		if len(got) == 0 && len(tt.want) == 0 {
+			continue
+		}
+		if !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("%s: filterKeys = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }

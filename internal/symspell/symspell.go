@@ -49,9 +49,9 @@ func (s *SymSpell) appendUnique(key, word string) {
 // reported by freqOf), with alphabetical tie-breaking for determinism. Because
 // FuzzySearch walks each bucket front-to-back, keeping the buckets frequency-
 // sorted lets the most common corrections surface first with zero per-query
-// sorting. Callers invoke this once at an index finalize point (Index,
-// CompactDeleted, LoadAll) after all words are present, so FuzzySearch stays
-// allocation- and sort-free on the hot path.
+// sorting. Callers invoke this once at an index finalize point (Index) after
+// all words are present, so FuzzySearch stays allocation- and sort-free on the
+// hot path.
 func (s *SymSpell) SortByFrequency(freqOf func(word string) int) {
 	for _, words := range s.DeleteMap {
 		if len(words) < 2 {

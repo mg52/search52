@@ -165,55 +165,6 @@ func TestFilterCategoryChange_MultiTerm(t *testing.T) {
 	assertIDs(t, res.Docs, "1", "2")
 }
 
-// TestFilterCategoryChange_WithCompact verifies that after CompactDeleted, the
-// old category's filter bits are fully pruned and the new category's bits survive.
-func TestFilterCategoryChange_WithCompact(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
-
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":       "1",
-		"title":    "camping gear",
-		"category": "outdoors",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument: %v", err)
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":       "1",
-		"title":    "camping gear",
-		"category": "sports",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument update: %v", err)
-	}
-
-	se.CompactDeleted()
-
-	// Old category must produce no results
-	res, _ := se.Search(context.Background(), "camping", map[string][]interface{}{"category": {"outdoors"}})
-	if res == nil {
-		t.Fatal("Search returned nil")
-	}
-	if len(res.Docs) != 0 {
-		t.Fatalf("expected no results for old category after compact, got %+v", res.Docs)
-	}
-
-	// New category must still return the doc
-	res, _ = se.Search(context.Background(), "camping", map[string][]interface{}{"category": {"sports"}})
-	if res == nil {
-		t.Fatal("Search returned nil")
-	}
-	assertIDs(t, res.Docs, "1")
-
-	// Verify old filter bits are absent from FilterBits after compact
-	se.mu.RLock()
-	oldBits := se.FilterBits["category:outdoors"]
-	se.mu.RUnlock()
-	for _, w := range oldBits {
-		if w != 0 {
-			t.Fatal("expected FilterBits['category:outdoors'] to be empty after compact")
-		}
-	}
-}
-
 // TestFilterCategoryChange_ArrayCategory verifies that array-valued filter fields
 // are correctly updated when a document is re-indexed with a different set.
 func TestFilterCategoryChange_ArrayCategory(t *testing.T) {
@@ -309,52 +260,6 @@ func TestFilterCategoryChange_MultipleFilterFields(t *testing.T) {
 	// Combined old category + year → no results
 	assertIDs(t, mustSingleTermSearchLoop(t, se, "jazz",
 		map[string][]interface{}{"category": {"music"}, "year": {"2020"}}))
-}
-
-// TestFilterCategoryChange_SaveLoad verifies that a category-changed document is
-// correctly re-indexed after a save/load cycle.
-func TestFilterCategoryChange_SaveLoad(t *testing.T) {
-	se := NewSearchEngine([]string{"title"}, nil, map[string]bool{"category": true}, 10)
-
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":       "1",
-		"title":    "electric guitar",
-		"category": "music",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument: %v", err)
-	}
-	if err := se.AddOrUpdateDocument(map[string]interface{}{
-		"id":       "1",
-		"title":    "electric guitar",
-		"category": "equipment",
-	}); err != nil {
-		t.Fatalf("AddOrUpdateDocument update: %v", err)
-	}
-
-	dir := t.TempDir()
-	if err := se.SaveAll(dir); err != nil {
-		t.Fatalf("SaveAll: %v", err)
-	}
-	loaded, err := LoadAll(dir)
-	if err != nil {
-		t.Fatalf("LoadAll: %v", err)
-	}
-
-	// Old category must not match after load
-	res, _ := loaded.Search(context.Background(), "electric", map[string][]interface{}{"category": {"music"}})
-	if res == nil {
-		t.Fatal("Search returned nil")
-	}
-	if len(res.Docs) != 0 {
-		t.Fatalf("expected no results for old category 'music' after load, got %+v", res.Docs)
-	}
-
-	// New category must match after load
-	res, _ = loaded.Search(context.Background(), "electric", map[string][]interface{}{"category": {"equipment"}})
-	if res == nil {
-		t.Fatal("Search returned nil")
-	}
-	assertIDs(t, res.Docs, "1")
 }
 
 // TestFilterCategoryChange_Sequential verifies that multiple sequential category

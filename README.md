@@ -2,17 +2,15 @@
 
 # In-Memory Search Engine
 
-A lightweight, fast, in-memory inverted-index search engine with HTTP handlers and on-disk persistence.  
+A lightweight, fast, in-memory inverted-index search engine with HTTP handlers. All data lives in memory and is lost on restart.  
 
 ## Features
 
 - **Full-text indexing** on arbitrary JSON documents  
 - **Prefix & fuzzy matching** — prefix map for instant completions + SymSpell for Levenshtein fuzzy suggestions  
 - **Filters** on arbitrary document fields (OR within a field, AND across fields)  
-- **Popularity ranking** — a static `popularity` field boosts search scores  
 - **HTTP API** for index creation, search, single-doc upsert/delete, bulk add  
-- **Persistence** — saves documents + metadata + popularity and rebuilds all derived indexes on load  
-- **Docker-ready** — runs as an unprivileged user, persists under a mounted volume  
+- **Docker-ready** — runs as an unprivileged user  
 
 ---
 
@@ -80,7 +78,6 @@ Bench tooling documentation lives in [cmd/bench/README.md](cmd/bench/README.md)
 
 ```bash
 export ADMINKEY='local-dev-key'
-export SEARCH52_INDEX_DATA_DIR='./data'
 go run ./cmd/service
 ```
 
@@ -92,7 +89,7 @@ Open the admin UI:
 http://localhost:8081
 ```
 
-Enter the same `ADMINKEY` value in the UI header before creating indexes, writing documents, saving, loading, or compacting. Read-only actions such as listing indexes, search, and health checks do not require the key.
+Enter the same `ADMINKEY` value in the UI header before creating indexes or writing documents. Read-only actions such as listing indexes, search, and health checks do not require the key.
 
 ### Docker
 
@@ -102,9 +99,7 @@ docker build -t searchengine:latest .
 docker run -d \
   -p 8080:8080 \
   -p 8081:8081 \
-  -v search_data:/data \
   -e ADMINKEY='change-me' \
-  -e SEARCH52_INDEX_DATA_DIR=/data \
   --name searchengine \
   searchengine:latest
 ```
@@ -133,9 +128,9 @@ Documents are identified internally by a monotonically increasing `uint32`:
 | `Documents` | internal ID → raw field map (active docs only) |
 | `DocDeleted` | tombstoned internal ID → true |
 
-**Update / delete semantics**: updating a document assigns a new internal ID for the new version; deleting removes it outright. In both cases the old internal ID is **eagerly removed** from `Documents`, `ExternalToInternal`, `InternalToExternal`, and the popularity maps, and is recorded in `DocDeleted`. The doc-level maps therefore only ever hold live records — `storedDocs` always equals `activeDocs`.
+**Update / delete semantics**: updating a document assigns a new internal ID for the new version; deleting removes it outright. In both cases the old internal ID is **eagerly removed** from `Documents`, `ExternalToInternal`, and `InternalToExternal`, and is recorded in `DocDeleted`. The doc-level maps therefore only ever hold live records — `storedDocs` always equals `activeDocs`.
 
-What is *not* cleaned up eagerly are the old version's entries in the inverted index (`DataMap`) and filter bitsets (`FilterBits`); removing a single ID from every posting list is too expensive, so those stale entries linger and are skipped at scan time via the `DocDeleted` tombstone. `len(DocDeleted)` is the count of versions awaiting reclaim and is surfaced as `deletedVersions` in the list-indexes response — a good signal for when to compact. The compact endpoint rebuilds the inverted index, filter bitsets, prefix map, and fuzzy dictionary from active documents only, then clears all tombstones. Compaction reassigns internal IDs densely from 1, and rebuilds in parallel (workers tokenize while a single consumer writes, so peak memory stays bounded). Popularity scores are keyed by external ID and survive compaction untouched.
+What is *not* cleaned up eagerly are the old version's entries in the inverted index (`DataMap`) and filter bitsets (`FilterBits`); removing a single ID from every posting list is too expensive, so those stale entries linger and are skipped at scan time via the `DocDeleted` tombstone. `len(DocDeleted)` is the count of versions awaiting reclaim and is surfaced as `deletedVersions` in the list-indexes response. Because there is no compaction, stale entries stay until the index is recreated, so memory grows with every update or delete.
 
 ### 3. Prefix and Fuzzy Matching
 
@@ -207,22 +202,6 @@ Rather than intersecting all groups eagerly, the engine picks the **smallest gro
 
 Score for a matching document is the sum of its scores across all matched groups.
 
-### 8. Popularity Ranking
-
-A static signal adds a flat boost to a document's match score, keyed by external ID:
-
-```go
-StaticPopularity map[string]int // from the doc's "popularity" field at index time
-```
-
-- **Static popularity** is read from each document's `popularity` field (int or numeric) when it is indexed or updated. Writing a document with no/zero `popularity` clears any previous value. Deleting a document clears its popularity entry.
-
-During search, `staticPop[extID]` is added to the boosted term score before the candidate enters the top-k heap, in both single- and multi-term paths. The lookup is guarded by a `hasPopularity` flag so indexes that use no popularity pay zero overhead. Because the map is keyed by external ID and maintained in sync with the active set, it needs no special handling in compaction.
-
-### 9. Persistence
-
-`SaveAll` serialises only the active document store, metadata (field config), and the popularity map to a single gob file — tombstoned versions are never written. `LoadAll` restores the documents and popularity, then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `SymSpell`, and the ID maps — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change. If `engine.gob` is corrupt or fails validation during the HTTP load endpoint, the existing in-memory index is left unchanged and the endpoint returns a clear error.
-
 ---
 
 ## HTTP API
@@ -237,7 +216,7 @@ All endpoints return JSON and use HTTP status codes (`201 Created`, `200 OK`, `4
 }
 ```
 
-Input validation is intentionally strict: index/filter/field names may contain only letters, numbers, `_`, `-`, and `.`; unknown JSON fields are rejected; `resultCount` must be between 1 and 10 000; search queries are capped at 512 characters; filter strings are capped at 2 048 characters; individual filter values are capped at 256 characters; JSON request bodies are capped at 1 MiB except single-document writes, which allow 5 MiB; bulk uploads allow up to 1 GiB.
+Input validation is intentionally strict: index/filter/field names may contain only letters, numbers, `_`, `-`, and `.` (names made only of dots, such as `.` or `..`, are rejected); unknown JSON fields are rejected; `resultCount` must be between 1 and 10 000; search queries are capped at 512 characters; filter strings are capped at 2 048 characters; individual filter values are capped at 256 characters; JSON request bodies are capped at 1 MiB except single-document writes, which allow 5 MiB; bulk uploads allow up to 1 GiB.
 
 Mutating endpoints require an admin key. Set `ADMINKEY` in the service environment and send the same value with the `X-Admin-Key` header. Missing or wrong keys return `401 Unauthorized`.
 
@@ -247,9 +226,6 @@ Protected endpoints:
 - `POST /add-to-index`
 - `POST /document`
 - `DELETE /document`
-- `POST /save-controller`
-- `POST /load-controller`
-- `POST /compact-index`
 
 Read-only endpoints (`/list-indexes`, `/search`, `/health`) do not require the key.
 
@@ -276,7 +252,7 @@ curl -X POST http://localhost:8080/create-index \
 curl http://localhost:8080/list-indexes
 ```
 
-The response includes every in-memory index and its document counts. `activeDocs` is the current live record count; `storedDocs` is the number of documents materialised in memory (always equal to `activeDocs`, since tombstoned versions are removed eagerly); `deletedVersions` is the number of stale posting/bitset versions awaiting reclaim by compaction (`len(DocDeleted)`) — when this grows large, run compact.
+The response includes every in-memory index and its document counts. `activeDocs` is the current live record count; `storedDocs` is the number of documents materialised in memory (always equal to `activeDocs`, since tombstoned versions are removed eagerly); `deletedVersions` is the number of stale posting/bitset versions left behind by updates and deletes (`len(DocDeleted)`).
 
 ```json
 {
@@ -305,7 +281,7 @@ curl -X POST 'http://localhost:8080/add-to-index?indexName=products' \
   -F 'file=@docs.json'
 ```
 
-The uploaded file can be either a JSON array of objects or a CSV file with a header row. Every document should include an `id` field; documents without a usable `id` are skipped by the indexer. An optional numeric `popularity` field is read as a static ranking boost.
+The uploaded file can be either a JSON array of objects or a CSV file with a header row. Every document should include an `id` field; documents without a usable `id` are skipped by the indexer.
 
 JSON example:
 
@@ -365,40 +341,7 @@ curl -X DELETE 'http://localhost:8080/document?indexName=products&id=14' \
   -H 'X-Admin-Key: local-dev-key'
 ```
 
-### 7. Save Index
-
-```bash
-curl -X POST http://localhost:8080/save-controller \
-  -H 'Content-Type: application/json' \
-  -H 'X-Admin-Key: local-dev-key' \
-  -d '{ "indexName": "products" }'
-```
-
-Indexes are saved under `$SEARCH52_INDEX_DATA_DIR/<indexName>/engine.gob`; if `SEARCH52_INDEX_DATA_DIR` is not set, the service uses `./data`.
-
-### 8. Load Index
-
-```bash
-curl -X POST http://localhost:8080/load-controller \
-  -H 'Content-Type: application/json' \
-  -H 'X-Admin-Key: local-dev-key' \
-  -d '{ "indexName": "products" }'
-```
-
-Load is rollback-safe: a corrupt or invalid `engine.gob` does not replace an already-loaded in-memory index.
-
-### 9. Compact Index
-
-```bash
-curl -X POST http://localhost:8080/compact-index \
-  -H 'Content-Type: application/json' \
-  -H 'X-Admin-Key: local-dev-key' \
-  -d '{ "indexName": "products" }'
-```
-
-Compaction removes tombstoned old document versions from all postings, filters, prefix arrays, and fuzzy data, and reassigns internal IDs densely from 1. Popularity scores are preserved. The response includes before/after active and stored document counts plus the number of removed versions.
-
-### 10. Health Check
+### 7. Health Check
 
 ```bash
 curl http://localhost:8080/health
@@ -425,8 +368,6 @@ The admin UI runs on a separate port and shares the same in-memory engine instan
 - add or update a single JSON document
 - delete a single document by ID
 - run search queries with optional filters
-- save and load indexes from disk
-- compact an index to remove tombstoned versions
 
 The UI port can be changed with `SEARCH52_ADMIN_ADDR`; the API port can be changed with `SEARCH52_API_ADDR`.
 
