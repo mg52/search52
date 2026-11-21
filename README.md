@@ -16,15 +16,13 @@ A lightweight, fast, in-memory inverted-index search engine with HTTP handlers a
 
 ---
 
-## Benchmark
-
-All numbers are from an Apple M1 Pro. The MusicBrainz load test uses the real `mb_5m.json` dataset. The in-process benchmark below uses generated 1 000 000 and 5 000 000 document datasets with **100 000 unique vocabulary words**, `title` (3-20 words) and `tags` (1-10 words) index fields, and `year` (2000-2024) as the filter field.
+## Benchmarks
 
 ### MusicBrainz 5 M HTTP load test
 
 Environment: Apple M1 Pro, darwin/arm64, Go 1.25.4, `GOMAXPROCS=10`.
 
-Dataset: `mb_5m.json`, 5 000 000 MusicBrainz documents, 585 MB JSON. Index fields: `title`, `artist`, `album`. Filter field: `year`. Result size: 100. Hard-coded prefix map cap: 5 000. Multi-term last-token prefix expansion is adaptive: 100 completions for 1-2 chars, 60 for 3-5 chars, and 50 after that. Query vocabulary: all unique tokens extracted from the same indexed text fields. Single-term queries are 65% exact, 25% prefix, 10% misspelled; multi-term queries use 2-4 tokens, 10% have one misspelled token, and the last token is prefix-truncated 25% of the time. `-mode-mix balanced` sends equal traffic to Single/NoFilter, Single/Filter, Multi/NoFilter, and Multi/Filter.
+Dataset: 5 000 000 MusicBrainz documents. Result size: 100. Hard-coded prefix map cap: 5 000. Multi-term last-token prefix expansion is adaptive: 100 completions for 1-2 chars, 60 for 3-5 chars, and 50 after that. Query vocabulary: all unique tokens extracted from the same indexed text fields. Single-term queries are 65% exact, 25% prefix, 10% misspelled; multi-term queries use 2-4 tokens, 10% have one misspelled token, and the last token is prefix-truncated 25% of the time. `-mode-mix balanced` sends equal traffic to Single/NoFilter, Single/Filter, Multi/NoFilter, and Multi/Filter.
 
 Index/load summary:
 
@@ -33,19 +31,20 @@ Index/load summary:
 | Documents indexed | 5 000 000 |
 | JSON file size | 585 MB |
 | Vocabulary size | All unique tokens from `title`, `artist`, `album` |
+| Filtered field | `year` |
 | Total index time | 94.85 s |
 
 HTTP load-test results:
 
-The load-test client drains each response body before recording latency.
+100 000 queries (25 000 per mode) were sent by 16 workers in 1m3.425s of wall time (1576.7 RPS overall, 394.2 RPS per mode).
 
-| Scope | Workers | Queries | Errors | Client errors | HTTP statuses | Wall time | RPS | avg | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| Overall | 16 | 100000 | 0 | 0 | {200:100000} | 1m3.425s | 1576.7 | 10.12ms | 4.62ms | 32.03ms | 90.71ms |
-| Single / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.96ms | 4.30ms | 24.96ms | 54.66ms |
-| Single / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.70ms | 3.51ms | 24.38ms | 60.46ms |
-| Multi / NoFilter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 16.89ms | 6.60ms | 58.06ms | 177.62ms |
-| Multi / Filter | 16 | 25000 | 0 | 0 | {200:25000} | 1m3.425s | 394.2 | 7.94ms | 4.24ms | 26.09ms | 53.91ms |
+| Scope | avg | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| Overall | 10.12ms | 4.62ms | 32.03ms | 90.71ms |
+| Single / NoFilter | 7.96ms | 4.30ms | 24.96ms | 54.66ms |
+| Single / Filter | 7.70ms | 3.51ms | 24.38ms | 60.46ms |
+| Multi / NoFilter | 16.89ms | 6.60ms | 58.06ms | 177.62ms |
+| Multi / Filter | 7.94ms | 4.24ms | 26.09ms | 53.91ms |
 
 ### In-process benchmark
 
