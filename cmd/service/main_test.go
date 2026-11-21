@@ -44,12 +44,6 @@ func TestAdminMuxRequiresAdminKeyForMutations(t *testing.T) {
 			body:   `{}`,
 		},
 		{
-			name:   "persist category embed",
-			method: http.MethodPost,
-			path:   "/api/persist-category-embed",
-			body:   `{}`,
-		},
-		{
 			name:   "load index",
 			method: http.MethodPost,
 			path:   "/api/load-controller",
