@@ -24,13 +24,17 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 FROM busybox:1.35
 
 # Create a non-root user
-RUN adduser -D -u 1000 appuser
+RUN adduser -D -u 1000 appuser && mkdir /data && chown appuser /data
 
 # Copy the static binary
 COPY --from=builder /searchengine /usr/local/bin/searchengine
 
 # Switch to non-root
 USER appuser
+
+# save-index / load-index snapshots
+ENV SEARCH52_INDEX_DATA_DIR=/data
+VOLUME /data
 
 # Expose the API and admin UI ports
 EXPOSE 8080 8081

@@ -24,6 +24,7 @@ func main() {
 	}
 
 	ht := handler.NewHTTP()
+	ht.DataDir = getenv("SEARCH52_INDEX_DATA_DIR", ht.DataDir)
 
 	apiAddr := getenv("SEARCH52_API_ADDR", ":8080")
 	adminAddr := getenv("SEARCH52_ADMIN_ADDR", ":8081")
@@ -75,6 +76,9 @@ func newAPIMux(ht *handler.HTTP) *http.ServeMux {
 	mux.HandleFunc("/list-indexes", ht.ListIndexes)
 	mux.HandleFunc("/health", ht.Health)
 	mux.HandleFunc("/document", requireAdminKey(documentHandler(ht)))
+	mux.HandleFunc("/delete-index", requireAdminKey(ht.DeleteIndex))
+	mux.HandleFunc("/save-index", requireAdminKey(ht.SaveIndex))
+	mux.HandleFunc("/load-index", requireAdminKey(ht.LoadIndex))
 	return mux
 }
 
@@ -87,6 +91,9 @@ func newAdminMux(ht *handler.HTTP) *http.ServeMux {
 	mux.HandleFunc("/api/list-indexes", ht.ListIndexes)
 	mux.HandleFunc("/api/health", ht.Health)
 	mux.HandleFunc("/api/document", requireAdminKey(documentHandler(ht)))
+	mux.HandleFunc("/api/delete-index", requireAdminKey(ht.DeleteIndex))
+	mux.HandleFunc("/api/save-index", requireAdminKey(ht.SaveIndex))
+	mux.HandleFunc("/api/load-index", requireAdminKey(ht.LoadIndex))
 	return mux
 }
 

@@ -52,6 +52,9 @@
       <button class="tab-button" data-tab="add" onclick="openTab('add')">Add/Update Document</button>
       <button class="tab-button" data-tab="delete" onclick="openTab('delete')">Delete Document</button>
       <button class="tab-button" data-tab="search" onclick="openTab('search')">Search</button>
+      <button class="tab-button" data-tab="save" onclick="openTab('save')">Save Index</button>
+      <button class="tab-button" data-tab="load" onclick="openTab('load')">Load Index</button>
+      <button class="tab-button" data-tab="deleteIndex" onclick="openTab('deleteIndex')">Delete Index</button>
     </nav>
     <section id="tab-indexes" class="tab-panel active">
       <h2>Indexes</h2>
@@ -96,6 +99,27 @@
       <label>Filter</label>
       <input id="searchFilter" placeholder="year:2026,category:electronics">
       <p><button onclick="search()">Search</button></p>
+    </section>
+    <section id="tab-save" class="tab-panel">
+      <h2>Save Index</h2>
+      <label>Index name</label>
+      <input id="saveIndexName" placeholder="products">
+      <p><button onclick="saveIndex()">Save</button></p>
+    </section>
+    <section id="tab-load" class="tab-panel">
+      <h2>Load Index</h2>
+      <label>Index name</label>
+      <input id="loadIndexName" placeholder="products">
+      <label>Timestamp (optional, UTC YYYYMMDDHHMMSS; latest when empty)</label>
+      <input id="loadTimestamp" placeholder="20261122144532">
+      <p><button onclick="loadIndex()">Load</button></p>
+    </section>
+    <section id="tab-deleteIndex" class="tab-panel">
+      <h2>Delete Index</h2>
+      <p class="status">Removes the index and all its documents from memory. Saved snapshots on disk are kept.</p>
+      <label>Index name</label>
+      <input id="deleteIndexName" placeholder="products">
+      <p><button onclick="removeIndex()">Delete Index</button></p>
     </section>
     <section>
       <h2>Response</h2>
@@ -201,6 +225,25 @@
       const filter = document.getElementById('searchFilter').value.trim();
       if (filter) params.set('filter', filter);
       await request('/api/search?' + params.toString(), { method: 'GET' });
+    }
+    async function saveIndex() {
+      const params = new URLSearchParams();
+      params.set('indexName', document.getElementById('saveIndexName').value.trim());
+      await request('/api/save-index?' + params.toString(), { method: 'POST', headers: adminHeaders() });
+    }
+    async function loadIndex() {
+      const params = new URLSearchParams();
+      params.set('indexName', document.getElementById('loadIndexName').value.trim());
+      const timestamp = document.getElementById('loadTimestamp').value.trim();
+      if (timestamp) params.set('timestamp', timestamp);
+      await request('/api/load-index?' + params.toString(), { method: 'POST', headers: adminHeaders() });
+    }
+    async function removeIndex() {
+      const indexName = document.getElementById('deleteIndexName').value.trim();
+      if (!confirm('Delete index "' + indexName + '" and all its documents?')) return;
+      const params = new URLSearchParams();
+      params.set('indexName', indexName);
+      await request('/api/delete-index?' + params.toString(), { method: 'DELETE', headers: adminHeaders() });
     }
     refreshIndexes(false);
   </script>
