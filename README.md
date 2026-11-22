@@ -2,7 +2,7 @@
 
 # In-Memory Search Engine
 
-A lightweight, fast, in-memory inverted-index search engine with HTTP handlers. All data lives in memory and is lost on restart.  
+A lightweight, fast, in-memory inverted-index search engine with HTTP handlers. All data lives in memory; use `save-index` / `load-index` to write an index to disk and restore it.  
 
 ## Features
 
@@ -100,6 +100,7 @@ docker run -d \
   -p 8080:8080 \
   -p 8081:8081 \
   -e ADMINKEY='change-me' \
+  -v search52-data:/data \
   --name searchengine \
   searchengine:latest
 ```
@@ -226,6 +227,9 @@ Protected endpoints:
 - `POST /add-to-index`
 - `POST /document`
 - `DELETE /document`
+- `POST /save-index`
+- `POST /load-index`
+- `DELETE /delete-index`
 
 Read-only endpoints (`/list-indexes`, `/search`, `/health`) do not require the key.
 
@@ -341,7 +345,28 @@ curl -X DELETE 'http://localhost:8080/document?indexName=products&id=14' \
   -H 'X-Admin-Key: local-dev-key'
 ```
 
-### 7. Health Check
+### 7. Save Index
+
+`POST /save-index?indexName=products` writes a snapshot into the data directory (`SEARCH52_INDEX_DATA_DIR`, default `./data`). Two files are written, with a UTC timestamp:
+
+- `index_<indexName>_<YYYYMMDDHHMMSS>.json` — the index definition (same fields as `create-index`)
+- `documents_<indexName>_<YYYYMMDDHHMMSS>.json` — a JSON array of the active documents
+
+Only a short read lock is held to copy document references; encoding and disk writes run outside the engine lock, so searches and writes continue while saving. Files are written to a temp name and renamed, documents first.
+
+```json
+{"status":"success","statusCode":200,"indexName":"products","indexFile":"index_products_20261122144532.json","documentsFile":"documents_products_20261122144532.json","savedDocs":3,"duration":"1.2ms","durationMs":1}
+```
+
+### 8. Load Index
+
+`POST /load-index?indexName=products[&timestamp=20261122144532]` recreates the index from a snapshot (newest one when `timestamp` is omitted). It returns `409` if the index already exists and `404` if no snapshot is found. The index is built off to the side and only becomes visible when complete, so other indexes keep serving and no one sees a half-loaded index. Files are validated with the same rules as `create-index`.
+
+### 9. Delete Index
+
+`DELETE /delete-index?indexName=products` removes the index and all its documents from memory. Only the registry entry is removed under a brief lock: searches, updates and bulk adds already running on that index finish normally (a write that lands after the delete is discarded with the index), and other indexes are not affected. Saved snapshots on disk are not deleted. Returns `404` if the index does not exist.
+
+### 10. Health Check
 
 ```bash
 curl http://localhost:8080/health

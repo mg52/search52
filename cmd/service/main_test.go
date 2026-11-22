@@ -151,7 +151,7 @@ func TestAPIMuxRequiresAdminKeyAndAllowsPublicRoutes(t *testing.T) {
 	t.Setenv("ADMINKEY", "secret")
 	mux := newAPIMux(handler.NewHTTP())
 
-	for _, path := range []string{"/create-index", "/add-to-index?indexName=x", "/document?indexName=x"} {
+	for _, path := range []string{"/create-index", "/add-to-index?indexName=x", "/document?indexName=x", "/save-index?indexName=x", "/load-index?indexName=x", "/delete-index?indexName=x"} {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
 		if rec.Code != http.StatusUnauthorized {
@@ -198,6 +198,11 @@ func TestAdminPage(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<html") {
 		t.Fatalf("GET /: status = %d, body has html = %v", rec.Code, strings.Contains(rec.Body.String(), "<html"))
+	}
+	for _, route := range []string{"/api/save-index", "/api/load-index", "/api/delete-index"} {
+		if !strings.Contains(rec.Body.String(), route) {
+			t.Errorf("admin page does not call %q", route)
+		}
 	}
 	for _, removed := range []string{"save-controller", "load-controller", "compact-index", "update-prefix"} {
 		if strings.Contains(rec.Body.String(), removed) {

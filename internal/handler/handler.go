@@ -45,6 +45,16 @@ type ErrorResponse struct {
 	Error      string `json:"error"`
 }
 
+// DeleteIndexResponse is returned after an index was removed from memory.
+type DeleteIndexResponse struct {
+	Status      string `json:"status"`
+	StatusCode  int    `json:"statusCode"`
+	IndexName   string `json:"indexName"`
+	DeletedDocs int    `json:"deletedDocs"`
+	Duration    string `json:"duration"`
+	DurationMs  int64  `json:"durationMs"`
+}
+
 // AddToIndexRequest is the payload for adding documents to an existing index.
 type AddToIndexRequest struct {
 	IndexName string `json:"indexName"`
@@ -146,12 +156,16 @@ type HealthResponse struct {
 type HTTP struct {
 	mu      sync.RWMutex
 	engines map[string]*engine.SearchEngine
+
+	// DataDir is where save-index / load-index keep their snapshot files.
+	DataDir string
 }
 
 // NewHTTP initializes the handler with an empty map.
 func NewHTTP() *HTTP {
 	return &HTTP{
 		engines: make(map[string]*engine.SearchEngine),
+		DataDir: "data",
 	}
 }
 
@@ -473,6 +487,49 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 		ResultCount:  req.ResultCount,
 		FieldWeights: sec.FieldWeights,
 		Duration:     elapsed.String(),
+	})
+}
+
+// DeleteIndex removes an index and all its documents from memory.
+// DELETE /delete-index?indexName=...
+//
+// Only the registry entry is removed, under a brief write lock. Requests that
+// already hold the engine finish normally; the memory is freed by the GC once
+// the last one returns. Other indexes are never touched. Saved snapshots on
+// disk are left alone.
+func (ht *HTTP) DeleteIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		w.Header().Set("Allow", http.MethodDelete)
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+
+	indexName := r.URL.Query().Get("indexName")
+	if err := validateIdentifier("indexName", indexName, maxIndexNameLength); err != nil {
+		errJSON(w, http.StatusBadRequest, err)
+		return
+	}
+
+	start := time.Now()
+	ht.mu.Lock()
+	sec, ok := ht.engines[indexName]
+	delete(ht.engines, indexName)
+	ht.mu.Unlock()
+	if !ok {
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", indexName))
+		return
+	}
+
+	elapsed := time.Since(start)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(DeleteIndexResponse{
+		Status:      "success",
+		StatusCode:  http.StatusOK,
+		IndexName:   indexName,
+		DeletedDocs: sec.StoredDocumentCount(),
+		Duration:    elapsed.String(),
+		DurationMs:  elapsed.Milliseconds(),
 	})
 }
 

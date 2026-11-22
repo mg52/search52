@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,6 +127,29 @@ func (se *SearchEngine) StoredDocumentCount() int {
 	defer se.mu.RUnlock()
 
 	return len(se.Documents)
+}
+
+// ExportDocuments returns the active documents in insertion order. Stored doc
+// maps are never mutated after insert, so only references are copied under the
+// read lock; callers can serialize the result without blocking searches or writes.
+func (se *SearchEngine) ExportDocuments() []map[string]interface{} {
+	type entry struct {
+		id  uint32
+		doc map[string]interface{}
+	}
+	se.mu.RLock()
+	entries := make([]entry, 0, len(se.Documents))
+	for id, doc := range se.Documents {
+		entries = append(entries, entry{id, doc})
+	}
+	se.mu.RUnlock()
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
+	out := make([]map[string]interface{}, len(entries))
+	for i, e := range entries {
+		out[i] = e.doc
+	}
+	return out
 }
 
 // -------------------- Indexing --------------------

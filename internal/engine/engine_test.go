@@ -1661,3 +1661,21 @@ func TestFilterKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestExportDocuments_ActiveOnlyInInsertionOrder(t *testing.T) {
+	se := NewSearchEngine([]string{"name"}, nil, nil, 10)
+	for _, d := range []map[string]interface{}{
+		{"id": "a", "name": "one"}, {"id": "b", "name": "two"}, {"id": "c", "name": "three"},
+	} {
+		if err := se.AddOrUpdateDocument(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	se.DeleteDocument("b")
+	_ = se.AddOrUpdateDocument(map[string]interface{}{"id": "a", "name": "uno"}) // update moves "a" last
+
+	docs := se.ExportDocuments()
+	if len(docs) != 2 || docs[0]["id"] != "c" || docs[1]["id"] != "a" || docs[1]["name"] != "uno" {
+		t.Fatalf("unexpected export: %v", docs)
+	}
+}
